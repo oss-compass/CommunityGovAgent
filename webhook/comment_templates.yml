@@ -1,0 +1,67 @@
+# 规范性检查
+
+# 此前已有检查评论时，通知本次检查通过
+passed: |-
+  ### 提交内容规范性检查：通过
+
+# 部分匹配
+partial_match: |-
+  ### 提交内容规范性检查：未通过
+
+  #### 原因：部分匹配现有模板
+  此 Issue 已使用 **{name}** 模板，但仍有以下未匹配项：
+
+  {problems}
+
+  #### 模板完善建议：{name}
+
+  {template}
+
+# 未匹配，推荐成功
+recommended: |-
+  ### 提交内容规范性检查：未通过
+
+  #### 原因：未匹配现有模板
+  {reason}
+
+  #### 模板推荐：{name}
+  {template}
+
+# 未匹配，信息不足无法推荐
+insufficient_info: |-
+  ### 提交内容规范性检查：未通过
+
+  #### 原因：未匹配现有模板，信息不足
+  {reason}
+
+  #### 模板推荐：请补充信息后选择
+
+  <details>
+  <summary>请补充具体诉求，并从下方选择合适的模板填写。</summary>
+
+  {templates}
+  
+  </details>
+
+# 共用折叠块；列出多个候选时 name 填入“模板名：”，其余情况留空。
+template: |-
+  <details>
+  <summary>{name}展开显示模板内容，将模板内容复制到 Issue 中填写。</summary>
+
+  {content}
+
+  </details>
+
+template_title: |-
+  **模板标题**
+
+  {title_fence}text
+  {title}
+  {title_fence}
+
+template_body: |-
+  **模板正文（Markdown）**
+
+  {body_fence}markdown
+  {body}
+  {body_fence}

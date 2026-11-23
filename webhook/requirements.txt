@@ -1,0 +1,6 @@
+Flask>=3.1,<4
+gunicorn>=23,<24
+supervisor>=4.2,<5
+python-dotenv>=1,<2
+markdown-it-py>=3,<5
+PyYAML>=6,<7
