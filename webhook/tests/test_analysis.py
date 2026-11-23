@@ -140,7 +140,7 @@ class AnalysisTests(unittest.TestCase):
         Returns:
             None；细化后的文档类型仍被判错或产生公开评论时测试失败。
         """
-        path = Path(__file__).resolve().parents[2] / '.gitcode/ISSUE_TEMPLATE/documentation_template.yml'
+        path = Path(__file__).resolve().parent / 'fixtures/repository_templates/documentation_template.yml'
         file = {'filename': path.name, 'source': 'qiurq1/issue-gov-test2/.gitcode/ISSUE_TEMPLATE/' + path.name,
                 'content': path.read_text()}
         body = ('### 文档类型\n缺陷修正（描述不准确）\n'

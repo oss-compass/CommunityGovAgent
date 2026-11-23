@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compliance
 from errors import IssueProcessingError
+TEMPLATE_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "repository_templates"
 TOKEN = "test-platform-token"
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
     {"type": "textarea", "attributes": {"label": "问题描述", "placeholder": "请输入"},
@@ -20,7 +21,7 @@ SUGGESTION = {"status": "recommended", "template": "缺陷反馈", "reason": "�
 class ComplianceTests(unittest.TestCase):
     def test_title_prefix_trailing_whitespace_is_optional(self):
         """真实 CANNLab 模板允许省略分隔空格，但仍检查前缀内容。"""
-        path = Path(__file__).resolve().parents[2] / ".gitcode/ISSUE_TEMPLATE/cannlab_template.yml"
+        path = TEMPLATE_FIXTURES / "cannlab_template.yml"
         template = compliance.parse_template(path.read_text(), path.name)
         body = "\n".join(
             f"### {field['attributes']['label']}\n已补充实际信息"
@@ -294,15 +295,15 @@ class ComplianceTests(unittest.TestCase):
             self.assertFalse(Path(popen.call_args.kwargs["cwd"]).exists())
         self.assertTrue(raised.exception.retryable)
 
-    def test_all_repository_templates_and_required_dropdown_sections(self):
-        """验证仓库六个模板，以及必填下拉章节缺失或为空时的提示。
+    def test_template_fixtures_and_required_dropdown_sections(self):
+        """验证六个固定模板样例，以及必填下拉章节缺失或为空时的提示。
 
         Args:
             无。
         Returns:
             None；通过断言核对预期结果。
         """
-        directory = Path(__file__).resolve().parents[2] / ".gitcode/ISSUE_TEMPLATE"
+        directory = TEMPLATE_FIXTURES
         templates = [yaml.safe_load(path.read_text()) for path in sorted(directory.glob("*.yml"))]
         self.assertEqual(len(templates), 6)
         self.assertEqual(compliance.check_issue("test", "test", templates)["status"], "no_match")
@@ -354,7 +355,7 @@ class ComplianceTests(unittest.TestCase):
 
 class TemplateSelectionTests(unittest.TestCase):
     def test_bug_report_does_not_select_documentation_from_generic_heading(self):
-        directory = Path(__file__).resolve().parents[2] / ".gitcode/ISSUE_TEMPLATE"
+        directory = TEMPLATE_FIXTURES
         templates = [compliance.parse_template(p.read_text(), p.name) for p in sorted(directory.glob("*.yml"))]
         title = "[Bug-Report|缺陷反馈]: 首次 PR 欢迎消息中的 CLA FAQ 链接包含格式化占位符"
         body = "### 问题描述\n欢迎消息生成的链接包含格式化占位符。\n### 预期行为\n链接能打开。"
@@ -373,7 +374,7 @@ class TemplateSelectionTests(unittest.TestCase):
             self.assertEqual(compliance.check_issue(title, body, candidates)["status"], "pass")
 
     def test_complete_documentation_structure_matches_despite_wrong_title(self):
-        path = Path(__file__).resolve().parents[2] / ".gitcode/ISSUE_TEMPLATE/documentation_template.yml"
+        path = TEMPLATE_FIXTURES / "documentation_template.yml"
         template = compliance.parse_template(path.read_text(), path.name)
         headings = [field["attributes"]["label"] for field in template["body"]
                     if field.get("validations", {}).get("required")]

@@ -514,15 +514,15 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual({row["issue_number"] for row in rows}, {34, 35})
         self.assertTrue(all(row["state"] == "completed" for row in rows))
 
-    def test_repository_dropdown_template_completes_without_model(self):
-        """验证仓库下拉模板检查通过时不发表评论，无需调用模型。
+    def test_remote_dropdown_template_completes_without_model(self):
+        """使用固定样例模拟远端模板，验证检查通过时不发表评论或调用模型。
 
         Args:
             无。
         Returns:
             None；通过断言核对预期结果。
         """
-        path = Path(__file__).resolve().parents[2] / ".gitcode/ISSUE_TEMPLATE/documentation_template.yml"
+        path = Path(__file__).resolve().parent / "fixtures/repository_templates/documentation_template.yml"
         template = yaml.safe_load(path.read_text())
         sections = []
         for field in template["body"]:
