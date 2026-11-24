@@ -117,13 +117,10 @@ claude --version
 2. 在本目录的 `repository.yml` 中填写全部接入仓库及其维护者，注释示例可保留，在下方另写实际仓库和账号（生效配置不带 `#`），示例：
 
 ```yaml
-opencann/community-gov-agent:
-  - qiurq1
+owner/repo:
+  - maintainer-username
 
-qiurq1/issue-agent-test:
-  - qiurq1
-
-cann/infrastructure: []
+another-org/demo: []
 ```
 
 文件中的仓库均接入服务；无需 @ 维护者时填写 `[]`，未列出的仓库不接入。至少填写一个仓库。
