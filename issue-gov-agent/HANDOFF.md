@@ -73,7 +73,7 @@ PostgreSQL  events / reports
 
 状态：`queued`、`dispatching`、`running`、`completed`、`failed`、`superseded`。
 
-同一 Issue 的新通知把尚未完成的旧任务标为 `superseded`。PostgreSQL 用 `pg_advisory_xact_lock` 按 Issue 串行入队。消费者领取时写入 `owner`。消息重投后若被另一个消费者接管，旧持有者再写完成或失败会被拒绝。
+同一 Issue 的新通知把尚未完成的旧任务标为 `superseded`。PostgreSQL 用 `pg_advisory_xact_lock` 按 Issue 串行入队。消费者领取时写入 `owner`。同一次 `running` 只允许重投接管一次；旧持有者再写完成或失败会被拒绝。
 
 可重试错误最多 5 次，退避从 30 秒起、上限 300 秒。到期由消费者里的投递线程重新入队。`dispatching` 超过 60 秒且没有持有者继续处理时，才会被重新投递；正在 `running` 的任务不会被抢走。
 

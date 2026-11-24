@@ -279,7 +279,8 @@ def process_one(
             attempt = db.execute("""SELECT MAX(attempts) FROM events WHERE repository = ?
                                     AND issue_number = ? AND state = 'queued'""",
                                  (row["repository"], row["issue_number"])).fetchone()[0] + 1
-            db.execute("""UPDATE events SET state = 'running', attempts = ?, updated_at = ?, owner = NULL
+            db.execute("""UPDATE events SET state = 'running', attempts = ?, updated_at = ?, owner = NULL,
+                          handoff = 0
                           WHERE repository = ? AND issue_number = ? AND state = 'queued'""",
                        (attempt, now, row["repository"], row["issue_number"]))
 
@@ -543,23 +544,17 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
             return "ack"
         owner = secrets.token_hex(8)
         if state == "running" and redelivered:
-            # 原持有者失联后接管。比较并交换当前标识，避免两个消费者同时接管后都去执行检查。
-            # 更新落空说明任务已完成、已覆盖或被另一消费者抢走，不再执行检查和发评论。
+            # 同一次 running 只接管一次。不按刚读到的 owner 交换：先提交的接管会写下新标识，
+            # 后到的消费者再读一次就能再次匹配。handoff 从 0 改为 1 后，其余重投都落空。
             attempt = int(row["attempts"])
-            previous = row["owner"] if "owner" in row.keys() else None  # noqa: SIM118
-            if previous is None:
-                updated = db.execute("""UPDATE events SET updated_at=?, owner=?
-                                        WHERE event_id=? AND state='running' AND owner IS NULL""",
-                                     (now, owner, event_id))
-            else:
-                updated = db.execute("""UPDATE events SET updated_at=?, owner=?
-                                        WHERE event_id=? AND state='running' AND owner=?""",
-                                     (now, owner, event_id, previous))
+            updated = db.execute("""UPDATE events SET updated_at=?, owner=?, handoff=1
+                                    WHERE event_id=? AND state='running' AND handoff=0""",
+                                 (now, owner, event_id))
             if updated.rowcount == 0:
                 return "ack"
         else:
             attempt = int(row["attempts"]) + 1
-            updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?
+            updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?, handoff=0
                                     WHERE event_id=? AND state IN ('queued', 'dispatching')""",
                                  (attempt, now, owner, event_id))
             if updated.rowcount == 0:

@@ -22,6 +22,9 @@ def apply_sqlite(db) -> None:
     # 消费者领取任务时写入的持有者标识；进程重启或消息重投后，旧持有者的完成写入会被拒绝。
     if "owner" not in event_columns:
         db.execute("ALTER TABLE events ADD COLUMN owner TEXT")
+    # 同一次 running 只允许消息重投接管一次。新领取时回到 0。
+    if "handoff" not in event_columns:
+        db.execute("ALTER TABLE events ADD COLUMN handoff INTEGER NOT NULL DEFAULT 0")
     # 兜底接收端在覆盖旧任务与插入新任务之间崩溃的情况：同一 Issue 存在更新的行时，旧行标为已覆盖。
     # 只在启动时跑一次，由 BEGIN IMMEDIATE（SQLite）或 pg_advisory_lock（PostgreSQL）串行化。
     db.execute("""UPDATE events SET state='superseded'
@@ -81,6 +84,7 @@ def apply_postgres(connection) -> None:
                           NOT NULL DEFAULT '{DEFAULT_CHECKS}'""")
     # 消费者领取任务时写入的持有者标识，见 apply_sqlite 中的同名列。
     connection.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS owner TEXT")
+    connection.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS handoff INTEGER NOT NULL DEFAULT 0")
     connection.execute("CREATE INDEX IF NOT EXISTS events_queue ON events(state, next_attempt)")
     connection.execute("CREATE INDEX IF NOT EXISTS events_issue ON events(repository, issue_number, state)")
     # 与 apply_sqlite 相同：启动时兜底一次，覆盖接收端在覆盖旧任务后崩溃的情况。

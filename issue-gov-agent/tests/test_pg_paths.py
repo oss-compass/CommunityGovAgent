@@ -322,28 +322,37 @@ class PostgresPathTests(unittest.TestCase):
         self.assertEqual(reports, 1)
 
     def test_redelivery_takeover_runs_once(self):
-        """回归：多条重投同时看到 running 时，只有换到标识的那一个消费者执行检查。"""
+        """回归：先接管的消费者已经在检查时，后到的重投不能再执行一次。"""
+        import threading
         from concurrent.futures import ThreadPoolExecutor
         from unittest.mock import patch
         import issue_gov.worker as worker
         self._reset(state="running", attempts=1)
         config = _config(self.url)
         calls = []
+        started = threading.Event()
+        release = threading.Event()
 
         def process(config_, repository, number, *, client, checks=None):
-            time.sleep(0.05)
             calls.append(number)
+            started.set()
+            self.assertTrue(release.wait(2))
             return {"status": "pass", "comment_action": "suppressed"}
+
+        def deliver(_index):
+            return worker.handle_delivery(config, {"event_id": "pg-evt-1"}, True, client=object())
 
         with patch.object(worker, "_process_issue", side_effect=process):
             with ThreadPoolExecutor(max_workers=4) as pool:
-                actions = list(pool.map(
-                    lambda _: worker.handle_delivery(config, {"event_id": "pg-evt-1"}, True, client=object()),
-                    range(4)))
+                first = pool.submit(deliver, 0)
+                self.assertTrue(started.wait(2), "第一个消费者应进入检查")
+                rest = [pool.submit(deliver, index) for index in range(1, 4)]
+                release.set()
+                actions = [first.result(), *(item.result() for item in rest)]
         self.assertEqual(sorted(actions), ["ack"] * 4)
         self.assertEqual(calls, [1], "重投接管后只能有一个消费者执行检查")
         with self.connect() as db:
-            row = db.execute("SELECT state, attempts FROM events").fetchone()
+            row = db.execute("SELECT state, attempts, handoff FROM events").fetchone()
         self.assertEqual((row["state"], row["attempts"]), ("completed", 1))
 
 

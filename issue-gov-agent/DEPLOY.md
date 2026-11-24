@@ -80,7 +80,7 @@ scripts/service compose stop
 
 RabbitMQ 管理页面默认是 `http://127.0.0.1:15672`（用户和密码与 `RABBITMQ_USER`、`RABBITMQ_PASSWORD` 相同）。死信堆在 `issue.analysis.dlq`。处理完密钥或网络问题后执行 `scripts/service retry`，失败任务会重新进入分析队列，同时清空死信队列中对应上次失败的消息。
 
-同一 Issue 的多条通知在 PostgreSQL 下按 Issue 加咨询锁串行入队，只会留下一条活跃任务，其余标为已覆盖。消费者领取任务时写入持有者标识；消息重投后任务被新消费者接管时，旧持有者的完成或失败写入会被拒绝，不会覆盖接管者的结果。
+同一 Issue 的多条通知在 PostgreSQL 下按 Issue 加咨询锁串行入队，只会留下一条活跃任务，其余标为已覆盖。消费者领取任务时写入持有者标识。同一次处理中的消息重投只能接管一次；旧持有者的完成或失败写入会被拒绝，不会覆盖接管者的结果。
 
 Webhook 仍是 `http://服务器:7000/webhook`，请求头 `X-GitCode-Token` 使用 `.env` 里的 `WEBHOOK_SECRET`。存活检查是 `GET /health`，数据库和队列都可连接时 `GET /ready` 返回 200。
 
