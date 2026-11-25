@@ -64,7 +64,7 @@ PostgreSQL  events / reports
 - `common/`：数据库、队列、AtomGit 客户端、错误类型。不做成可安装包，也不要 `pip install -e`。
 - `issue-gov-agent/issue_gov/`：接收、消费者、检查和评论。`issue_gov/__init__.py` 把仓库根目录放进 `sys.path`，从而导入 `common`。
 - `issue-gov-agent/config/`：检查规则、推荐提示词、评论模板。结果文案改这里，不要改成另一套输出。
-- `scripts/service`：容器的唯一运维入口。
+- `scripts/service`：仍可用来启动、查看状态和重试失败任务。副本数不在这里改。
 - `manage.py`：本机 SQLite 和 Supervisor。它不设置 `SERVICE_MODE`，不会去连 Compose 里的 Postgres 或 RabbitMQ。
 
 容器入口直接调用 `receiver.py` 和 `worker.py` 的 `main()`，不经过 Supervisor。Compose 给容器设置 `SERVICE_MODE=queue`，应用再用 `.env` 里的账号拼出连接串，主机名是 `postgres` 和 `rabbitmq`。
@@ -103,18 +103,18 @@ Issue 或路径确实不存在时，平台返回 JSON 404，任务失败一次�
 
 ## 配置文件
 
-全项目只有一份环境文件：`issue-gov-agent/.env`。不要在仓库根目录再放 `.env`，也不要把 `DATABASE_URL`、`RABBITMQ_URL` 写进这份文件。这两个连接串由程序自己拼。
+这台机器的灰度配置在 `/opt/CommunityGovAgent/`。仓库里的 `issue-gov-agent/.env`、`issue-gov-agent/repository.yml` 和 `docker-compose.override.yml` 是指到该目录的符号链接，方便 `scripts/service` 继续使用原来的路径。不要在仓库根目录再放 `.env`，也不要把 `DATABASE_URL`、`RABBITMQ_URL` 写进环境文件。这两个连接串由程序自己拼。
 
 | 文件 | 是否提交 | 内容 |
 | --- | --- | --- |
-| `issue-gov-agent/.env` | 否 | Webhook 密码、AtomGit 令牌、模型密钥、数据库和队列口令 |
-| `issue-gov-agent/repository.yml` | 否 | 接入仓库和维护者 |
-| `issue-gov-agent/.consumer-scale` | 否 | 消费者副本数 |
-| `docker-compose.override.yml` | 否 | 本机把接收端口让开 7000 |
+| `/opt/CommunityGovAgent/.env` | 否 | Webhook 密码、AtomGit 令牌、模型密钥、数据库和队列口令 |
+| `/opt/CommunityGovAgent/repository.yml` | 否 | 接入仓库和维护者 |
+| `/opt/CommunityGovAgent/docker-compose.yml` | 否 | 灰度编排入口。项目名 `issue-gov`，镜像从 `/root/CommunityGovAgent` 构建。`consumer.deploy.replicas` 与仓库里的同名字段保持一致 |
+| `/opt/CommunityGovAgent/docker-compose.override.yml` | 否 | 接收端口只绑 `127.0.0.1:7100`，并挂载上面两份文件 |
 
 当前接入的仓库是 `cann/infrastructure`、`cann/community`、`cann/cannbot-skills`、`cann/runtime`、`cann/catlass`，每个仓库 1 名维护者。模型是智谱 `glm-5.3`，地址前缀为 `https://open.bigmodel.cn/api/anthropic`。密钥和口令只在 `.env` 里看，不要写进文档、提交信息或对话摘录。
 
-本机的 `docker-compose.override.yml` 必须保留，内容是：
+`/opt/CommunityGovAgent/docker-compose.override.yml` 必须保留，内容是：
 
 ```yaml
 services:
@@ -141,14 +141,18 @@ services:
 
 ## 更新灰度
 
-在仓库根目录：
+日常在 `/opt/CommunityGovAgent` 管理这一套容器。`docker compose` 会读同目录的 `.env` 和 `docker-compose.override.yml`，项目名是 `issue-gov`，数据卷仍是原来的两份。镜像构建使用 `/root/CommunityGovAgent` 里的代码。
 
 ```bash
-scripts/service up
-scripts/service status
+cd /opt/CommunityGovAgent
+docker compose ps
+docker compose up -d
+docker compose logs -f receiver consumer
 ```
 
-`up` 会按 `requirements.lock` 重建接收镜像和消费者镜像，并保留 `.consumer-scale` 里的副本数。没有这份文件时是 1 个消费者。数据卷 `issue_gov_postgres` 和 `issue_gov_rabbitmq` 会保留。
+消费者副本数写在两份编排文件的 `consumer.deploy.replicas`，当前是 1。改数量时两处一起改，然后在 `/opt/CommunityGovAgent` 执行 `docker compose up -d`。
+
+从仓库根目录执行 `scripts/service up` 也会操作同一套容器，并按 `requirements.lock` 重建镜像。它不再传入 `--scale`，副本数以编排文件为准。数据卷 `issue_gov_postgres` 和 `issue_gov_rabbitmq` 会保留。
 
 不要对正在服务的 RabbitMQ 运行 `scripts/concurrency_check.py`。它使用同一个 `issue.analysis` 队列，并会删除 `events`。PostgreSQL 回归要用独立库名 `issue_gov_test`：
 
@@ -183,7 +187,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://governance-agent.oss-c
 ## 接手时不要做的事
 
 - 不要动 Supervisor 管理的旧服务，不要改它的 `runtime/.env` 和 `runtime/repository.yml`。
-- 不要把 `.env`、`repository.yml`、`.consumer-scale`、`docker-compose.override.yml` 提交进 Git。
+- 不要把 `.env`、`repository.yml`、`docker-compose.override.yml` 提交进 Git。
 - 不要在灰度消费者还连着队列时跑 `scripts/concurrency_check.py`。
 - 不要用生产 Issue 做批量压测。模拟编号也会真实调用 AtomGit，和旧服务共用令牌。
 - 不要为了灰度去改已经指向 7000 的生产 Webhook。

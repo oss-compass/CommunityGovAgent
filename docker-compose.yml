@@ -1,7 +1,9 @@
 # 接收服务、消费者、PostgreSQL 和 RabbitMQ。
-# 唯一的环境文件是 issue-gov-agent/.env。请用 scripts/service 启动，它会把该文件传给 Compose。
+# 环境文件是 issue-gov-agent/.env。部署优先直接执行：
+#   docker compose --env-file issue-gov-agent/.env up -d --build
+# 并导出 CONTAINER_UID、CONTAINER_GID，否则容器用户落到 1000:1000。
 # 容器进程只额外设置 SERVICE_MODE=queue；服务用这份文件里的账号和口令拼出连接串。
-# 消费者数量：scripts/service scale 3
+# 消费者副本数见 consumer.deploy.replicas。灰度机器的 /opt/CommunityGovAgent/docker-compose.yml 保持同一数字。
 
 name: issue-gov
 
@@ -78,6 +80,9 @@ services:
     restart: unless-stopped
 
   consumer:
+    # 副本数在这里改，然后执行 docker compose up -d。
+    deploy:
+      replicas: 1
     build:
       context: .
       dockerfile: issue-gov-agent/Dockerfile

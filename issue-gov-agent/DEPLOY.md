@@ -64,9 +64,8 @@ python3 -m venv .venv
 在仓库根目录执行：
 
 ```bash
-scripts/service up
+docker compose --env-file issue-gov-agent/.env up -d --build
 scripts/service status
-scripts/service scale 3
 scripts/service retry
 scripts/service compose logs -f receiver consumer
 scripts/service compose stop
@@ -76,7 +75,7 @@ scripts/service compose stop
 
 消费者镜像包含 Node.js 22 和 Claude Code `2.1.316`，构建时需要能下载这两个组件。接收镜像不包含它们。Python 依赖按 `issue-gov-agent/requirements.lock` 安装，与 CI 使用同一组版本；更新依赖时同步修改锁文件。
 
-`scripts/service scale` 把副本数记在 `issue-gov-agent/.consumer-scale`（不提交）。之后的 `scripts/service up` 会带上这个数量，重新构建也不会退回 1。尚未执行过 `scale` 时按 1 个消费者启动。直接执行 `docker compose up` 时仍要自己加上 `--scale`。
+消费者副本数写在 `docker-compose.yml` 的 `consumer.deploy.replicas`，当前是 1。修改后执行 `docker compose up -d` 即可增减容器。灰度机器上的 `/opt/CommunityGovAgent/docker-compose.yml` 使用同一个数字。`scripts/service up` 不再传入 `--scale`，不会盖过这个配置。
 
 RabbitMQ 管理页面默认是 `http://127.0.0.1:15672`（用户和密码与 `RABBITMQ_USER`、`RABBITMQ_PASSWORD` 相同）。死信堆在 `issue.analysis.dlq`。处理完密钥或网络问题后执行 `scripts/service retry`，失败任务会重新进入分析队列，同时清空死信队列中对应上次失败的消息。
 
@@ -133,5 +132,5 @@ python3 scripts/concurrency_check.py
 | `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康；数据库暂不可达时接收进程保持运行并每 2 秒重试，`/ready` 返回 `initializing` |
 | 任务停在 `dispatching` | 消费者未运行或队列确认失败；启动消费者后，超过 60 秒会被重新投递 |
 | 任务 `failed` 且 `dead_lettered=1` | 查看 `last_error` 和死信队列，修复密钥或模型配置后执行 `scripts/service retry` |
-| 修改 `.env` 或仓库名单后未生效 | `scripts/service compose restart receiver consumer`；需要重建镜像时执行 `scripts/service up`，它会保留已记录的消费者副本数 |
+| 修改 `.env` 或仓库名单后未生效 | `scripts/service compose restart receiver consumer`；需要重建镜像时执行 `docker compose --env-file issue-gov-agent/.env up -d --build`，副本数仍以 `consumer.deploy.replicas` 为准 |
 | 只想恢复单机 | 不要设置 `SERVICE_MODE`，继续使用 `manage.py` |
