@@ -50,6 +50,8 @@ class DeliveryTests(unittest.TestCase):
 
     def request(self, method, path, data=None):
         """平台成功保存与客户端收到响应可分别模拟。"""
+        if '/labels' in path:
+            return {}
         if method == 'GET' and '/comments?' in path:
             if self.lookup_error:
                 raise self.lookup_error

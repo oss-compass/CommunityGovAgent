@@ -64,6 +64,8 @@ class CommentEditTests(unittest.TestCase):
         }
 
     def request(self, method, path, data=None):
+        if '/labels' in path:
+            return {}
         if method == 'GET':
             if '/comments?' in path:
                 if self.lookup_error:

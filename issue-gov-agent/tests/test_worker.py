@@ -53,6 +53,19 @@ class WorkerTests(unittest.TestCase):
                 {"encoding": "base64", "content": base64.b64encode(yaml.safe_dump(TEMPLATE).encode()).decode()},
                 issue if latest is None else latest, {}]
 
+    def replay(self, items):
+        """按顺序返回预设响应；检查标签请求不占用预设列表。"""
+        pending = list(items)
+
+        def respond(method, path, data=None):
+            if "/labels" in path:
+                return {}
+            if not pending:
+                raise AssertionError(f"多余的 AtomGit 请求：{method} {path}")
+            return pending.pop(0)
+
+        return respond
+
     def test_webhook_to_passing_check_without_comment(self):
         """验证通过检查后完成任务，不发表评论且不调用 Actions。
 
@@ -64,12 +77,12 @@ class WorkerTests(unittest.TestCase):
         app = receiver.create_app(self.config)
         payload = {"object_kind": "issue", "uuid": "event", "project": {"path_with_namespace": "example/repo"},
                    "object_attributes": {"iid": 12, "action": "open"}}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses()) as api:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses())) as api:
             with app.test_client() as client:
                 self.assertEqual(client.post("/webhook", json=payload, headers={"X-GitCode-Token": "secret"}).status_code, 202)
             api.assert_not_called()
             worker.process_one(self.config, client=atomgit.AtomGit(self.config.token, request_interval=0))
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
         with receiver.connect(self.config) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM issue_checks").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM maintainer_suggestions").fetchone()[0], 0)
@@ -89,7 +102,7 @@ class WorkerTests(unittest.TestCase):
         output = {"summary": {"status": "partial_match", "additional_check": "completed"},
                   "comment": "统一分析入口生成的完整评论", "publish_comment": True,
                   "maintainer_suggestion": None}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses()) as api, patch.object(
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses())) as api, patch.object(
                 worker, "analyze_issue", return_value=output) as analyze:
             result = worker._process_issue(self.config, "example/repo", 12,
                                           client=atomgit.AtomGit(self.config.token, request_interval=0))
@@ -100,20 +113,23 @@ class WorkerTests(unittest.TestCase):
             self.config.llm_model, self.config.llm_base_url,
             repository="example/repo", number=12, maintainers=("qiurq1",), previously_commented=False,
             checks=None)
-        self.assertEqual(api.call_args.args[2]["body"].split("\n\n<!-- issue-gov:")[0], output["comment"])
-        self.assertEqual(result, {**output["summary"], "comment_action": "created"})
+        comment = next(c.args[2]["body"] for c in api.call_args_list
+                       if c.args[0] == "POST" and c.args[1].endswith("/comments"))
+        self.assertEqual(comment.split("\n\n<!-- issue-gov:")[0], output["comment"])
+        self.assertEqual(result, {**output["summary"], "comment_action": "created",
+                                  "label": "issue-check-failed", "label_action": "assigned"})
         self.assertNotIn("comment_action", output["summary"])
 
     def test_worker_obeys_analysis_comment_decision_without_interpreting_status(self):
         """新增检查状态时，Worker 仍只消费分析入口给出的发布决定。"""
         output = {"summary": {"status": "additional_check_complete"}, "comment": "分析结果",
                   "publish_comment": False, "maintainer_suggestion": None}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses()) as api, patch.object(
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses())) as api, patch.object(
                 worker, "analyze_issue", return_value=output):
             result = worker._process_issue(self.config, "example/repo", 12,
                                           client=atomgit.AtomGit(self.config.token, request_interval=0))
-        self.assertEqual(result, {**output["summary"], "comment_action": "suppressed"})
-        self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+        self.assertEqual(result, {**output["summary"], "comment_action": "suppressed", "label_action": "skipped"})
+        self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
         with receiver.connect(self.config) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM issue_checks").fetchone()[0], 1)
 
@@ -142,16 +158,17 @@ class WorkerTests(unittest.TestCase):
                 responses = self.responses(issue=issue)
                 responses[2] = [{"type": "file", "name": filename}]
                 responses[3] = {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
-                with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
+                with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, patch.object(
                         compliance_recommend, "recommend_template", return_value={"status": "recommended",
                             "template": "question", "reason": "适合描述当前问题"}) as model:
                     result = worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
                 self.assertEqual(result["status"], status)
                 self.assertEqual(result["comment_action"], "suppressed" if status == "pass" else "created")
                 if status == "pass":
-                    self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+                    self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
                 else:
-                    comment = api.call_args.args[2]["body"]
+                    comment = next(c.args[2]["body"] for c in api.call_args_list
+                                   if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
                     self.assertIn(message, comment)
                 if status == "no_match":
                     model.assert_called_once()
@@ -186,7 +203,7 @@ class WorkerTests(unittest.TestCase):
                 else:
                     responses = self.responses()
                     responses[3] = {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
-                with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
+                with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, patch.object(
                         compliance_recommend, "recommend_template") as model:
                     client = atomgit.AtomGit(self.config.token, request_interval=0)
                     self.assertTrue(worker.process_one(self.config, client=client))
@@ -199,7 +216,7 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(result["status"], "template_error")
                 self.assertIsNone(result["recommendation_status"])
                 self.assertEqual(result["comment_action"], "suppressed")
-                self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+                self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
                 with receiver.connect(self.config) as db:
                     saved = db.execute("SELECT * FROM maintainer_suggestions WHERE id = ?",
                                        (result["maintainer_suggestion_id"],)).fetchone()
@@ -247,7 +264,7 @@ class WorkerTests(unittest.TestCase):
             self.assertFalse(worker.process_one(self.config, now=129, client=client))
             self.assertTrue(worker.process_one(self.config, now=130, client=client))
             self.assertEqual(receiver.queue_snapshot(self.config)["recent"][0]["state"], "completed")
-            self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+            self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
         with receiver.connect(self.config) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM maintainer_suggestions").fetchone()[0], 1)
 
@@ -261,12 +278,13 @@ class WorkerTests(unittest.TestCase):
         """
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
         recommendation = {"status": "recommended", "template": "缺陷反馈", "reason": "运行异常"}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)) as api, patch.object(
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))) as api, patch.object(
             compliance_recommend, "recommend_template", return_value=recommendation) as model:
             result = worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(model.call_args.args[-3:], ("model-key", "custom-model", "https://models.example"))
         self.assertEqual(result["recommendation_status"], "recommended")
-        comment = api.call_args.args[2]["body"]
+        comment = next(c.args[2]["body"] for c in api.call_args_list
+                       if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
         self.assertIn("#### 模板推荐：", comment)
         self.assertIn("**模板正文（Markdown）**", comment)
         self.assertNotIn("崩溃了", comment)
@@ -279,7 +297,7 @@ class WorkerTests(unittest.TestCase):
         responses = self.responses(issue)
         responses[3] = {"encoding": "base64", "content": base64.b64encode(
             yaml.safe_dump(documentation).encode()).decode()}
-        with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, patch.object(
             compliance_recommend, "recommend_template", return_value={"status": "not_applicable", "reason": "没有适合的模板",
                 "maintainer": "现有模板仅覆盖文档，建议新增工具缺陷反馈模板，收集问题描述和复现步骤。"},
         ) as model:
@@ -289,7 +307,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["status"], "no_match")
         self.assertEqual(result["recommendation_status"], "not_applicable")
         self.assertEqual(result["comment_action"], "suppressed")
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
         with receiver.connect(self.config) as db:
             row = db.execute("SELECT * FROM maintainer_suggestions").fetchone()
         self.assertIn("建议新增工具缺陷反馈模板", row["suggestion"])
@@ -311,11 +329,11 @@ class WorkerTests(unittest.TestCase):
         recommendation = {"status": "not_applicable", "reason": "无适用模板",
                           "maintainer": "建议新增成员申请模板，收集申请账号。"}
         client = atomgit.AtomGit(config.token, request_interval=0)
-        with patch.object(client, "request", side_effect=self.responses(issue)[:-1] * 3) as api, patch.object(
+        with patch.object(client, "request", side_effect=self.replay(self.responses(issue)[:-1] * 3)) as api, patch.object(
                 compliance_recommend, "recommend_template", return_value=recommendation):
             for repository in repositories:
                 worker._process_issue(config, repository, 12, client=client)
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
         with receiver.connect(config) as db:
             records = {row["repository"]: dict(row) for row in db.execute("SELECT * FROM maintainer_suggestions")}
         for repository, expected in zip(repositories, (("alice", "bob"), ("carol",), ())):
@@ -331,7 +349,7 @@ class WorkerTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         issue = {**ISSUE, "body": ""}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)), patch.object(compliance_recommend, "recommend_template") as model:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))), patch.object(compliance_recommend, "recommend_template") as model:
             self.assertEqual(worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))["status"], "partial_match")
         model.assert_not_called()
 
@@ -344,11 +362,11 @@ class WorkerTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)) as api:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))) as api:
             with self.assertRaises(IssueProcessingError) as raised:
                 worker._process_issue(replace(self.config, agent_api_key=""), "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertTrue(raised.exception.retryable)
-        self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+        self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
 
     def test_edit_during_analysis_retries_without_stale_comment(self):
         """验证分析期间 Issue 内容被修改时抛出可重试错误，不发布过时评论。
@@ -359,10 +377,10 @@ class WorkerTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         responses = self.responses(latest={**ISSUE, "body": "补充了信息"})
-        with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, self.assertRaises(IssueProcessingError) as error:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, self.assertRaises(IssueProcessingError) as error:
             worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertTrue(error.exception.retryable)
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
 
     def test_closed_issue_and_pull_request_never_receive_comment(self):
         """验证已关闭或检查期间关闭的 Issue 跳过评论，Pull Request 被拒绝。
@@ -380,9 +398,9 @@ class WorkerTests(unittest.TestCase):
                 else:
                     self.assertEqual(worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))["comment_action"], "skipped_closed")
             self.assertEqual(api.call_count, 1)
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(latest={**ISSUE, "state": "closed"})) as api:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(latest={**ISSUE, "state": "closed"}))) as api:
             self.assertEqual(worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))["comment_action"], "skipped_closed")
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
 
     def test_removed_repository_is_rejected_before_network(self):
         """验证未接入仓库在任何网络请求前被拒绝。
@@ -402,7 +420,7 @@ class WorkerTests(unittest.TestCase):
         client = atomgit.AtomGit(self.config.token, request_interval=0)
         issue = {**ISSUE, "body": "缺少章节"}
         edited = {**issue, "body": issue["body"] + "\n\n."}
-        with patch.object(client, "request", side_effect=[*self.responses(issue), edited, edited, {}]) as api:
+        with patch.object(client, "request", side_effect=self.replay([*self.responses(issue), edited, edited, {}])) as api:
             with app.test_client() as receiver_client:
                 for index in range(2):
                     payload = {"object_kind": "issue", "uuid": f"edit-{index}",
@@ -415,7 +433,7 @@ class WorkerTests(unittest.TestCase):
                         self.assertEqual(response.status_code, expected_status)
                     self.assertTrue(worker.process_one(self.config, client=client))
                     self.assertFalse(worker.process_one(self.config, client=client))
-        posts = [c for c in api.call_args_list if c.args[0] == "POST"]
+        posts = [c for c in api.call_args_list if c.args[0] == "POST" and c.args[1].endswith("/comments")]
         self.assertEqual(len(posts), 2)
         self.assertEqual(posts[0].args[2]["body"].split("\n\n<!-- issue-gov:")[0],
                          posts[1].args[2]["body"].split("\n\n<!-- issue-gov:")[0])
@@ -506,10 +524,10 @@ class WorkerTests(unittest.TestCase):
                     "object_attributes": {"iid": number, "action": "open"}})
                 self.assertEqual(response.status_code, 202)
         client = atomgit.AtomGit(self.config.token)
-        with patch.object(client, "request", side_effect=[*self.responses()[:-1], ISSUE, ISSUE]) as api:
+        with patch.object(client, "request", side_effect=self.replay([*self.responses()[:-1], ISSUE, ISSUE])) as api:
             self.assertTrue(worker.process_one(self.config, client=client))
             self.assertTrue(worker.process_one(self.config, client=client))
-        self.assertEqual(api.call_count, 7)
+        self.assertEqual(api.call_count, 11)
         self.assertEqual(sum(call.args[1] == "/user" for call in api.call_args_list), 0)
         rows = receiver.queue_snapshot(self.config)["recent"]
         self.assertEqual({row["issue_number"] for row in rows}, {34, 35})
@@ -534,10 +552,46 @@ class WorkerTests(unittest.TestCase):
         issue = {"title": template["title"] + "测试", "body": "\n".join(sections), "state": "open"}
         responses = self.responses(issue)
         responses[3] = {"encoding": "base64", "content": base64.b64encode(path.read_bytes()).decode()}
-        with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, \
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, \
                 patch.object(compliance_recommend, "recommend_template") as model:
             result = worker._process_issue(self.config, "example/repo", 35, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["comment_action"], "suppressed")
-        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
         model.assert_not_called()
+
+    def test_check_label_failure_keeps_the_task_and_later_tasks(self):
+        """仓库没有检查标签时，当前任务仍完成，下一任务继续打上自己的标签。"""
+        seen = []
+
+        def routed(issue, fail_add):
+            pending = self.responses(issue)
+
+            def respond(method, path, data=None):
+                seen.append((method, path, data))
+                if method == "POST" and path.endswith("/labels") and fail_add:
+                    raise IssueProcessingError("AtomGit 请求失败，HTTP 404", retryable=False, status_code=404)
+                if "/labels" in path:
+                    return {}
+                return pending.pop(0)
+
+            return respond
+
+        first = atomgit.AtomGit(self.config.token, request_interval=0)
+        second = atomgit.AtomGit(self.config.token, request_interval=0)
+        with patch.object(first, "request", side_effect=routed({**ISSUE, "body": ""}, True)):
+            failed = worker._process_issue(self.config, "example/repo", 12, client=first)
+        with patch.object(second, "request", side_effect=routed(ISSUE, False)):
+            passed = worker._process_issue(self.config, "example/repo", 13, client=second)
+        self.assertEqual(failed["status"], "partial_match")
+        self.assertEqual(failed["comment_action"], "created")
+        self.assertEqual(failed["label"], "issue-check-failed")
+        self.assertEqual(failed["label_action"], "rejected")
+        self.assertEqual(passed["status"], "pass")
+        self.assertEqual(passed["comment_action"], "suppressed")
+        self.assertEqual(passed["label"], "issue-check-passed")
+        self.assertEqual(passed["label_action"], "assigned")
+        self.assertIn(("POST", "/repos/example/repo/issues/12/labels", ["issue-check-failed"]), seen)
+        self.assertNotIn(("DELETE", "/repos/example/repo/issues/12/labels/issue-check-passed", None), seen)
+        self.assertIn(("POST", "/repos/example/repo/issues/13/labels", ["issue-check-passed"]), seen)
+        self.assertIn(("DELETE", "/repos/example/repo/issues/13/labels/issue-check-failed", None), seen)

@@ -270,7 +270,13 @@ def status() -> None:
                 actions = {"created": "已发布评论", "updated": "已更新评论", "unchanged": "评论无变化",
                            "suppressed": "静默处理，未发表评论",
                            "skipped_closed": "跳过已关闭的 Issue", "recovered": "已确认先前评论，未重复发布"}
+                label_actions = {"assigned": "已写入", "rejected": "未写入", "skipped": "未分配"}
                 details += "，" + actions.get(result.get("comment_action"), "已处理")
+                if result.get("label_action"):
+                    label_text = label_actions.get(result["label_action"], result["label_action"])
+                    if result.get("label"):
+                        label_text += " " + result["label"]
+                    details += "，标签" + label_text
             if row["last_error"]:
                 details += f"，最近错误 {row['last_error']}"
             print(details)

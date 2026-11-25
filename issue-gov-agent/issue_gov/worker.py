@@ -26,6 +26,8 @@ from issue_gov.settings import Config
 LOG = logging.getLogger("issue-gov-webhook")
 MAX_ATTEMPTS = 5  # 每个事件最多完成 5 次处理尝试；进程中断不消耗次数
 COMMENT_EDIT_SECONDS = 3 * 60
+CHECK_PASSED_LABEL = "issue-check-passed"
+CHECK_FAILED_LABEL = "issue-check-failed"
 
 
 def _issue_edit_time(issue: dict) -> float | None:
@@ -77,6 +79,63 @@ def _save_maintainer_suggestion(db, repository: str, number: int, suggestion: di
                        suggestion["reason"], suggestion["suggestion"], suggestion["mtr"])).lastrowid
 
 
+def _verdict_labels(summary: dict) -> tuple[str, str] | None:
+    """按规范性检查结论选择要写入的标签，以及需要去掉的相反标签。
+
+    通过、以及未匹配但推荐认为不适用，使用 issue-check-passed。
+    部分匹配和其余未匹配使用 issue-check-failed。模板故障、关闭和未变化没有结论，不改标签。
+
+    Args:
+        summary: 分析摘要，包含 status，未匹配时还包含 recommendation_status。
+    Returns:
+        (要添加的标签, 要移除的相反标签)；没有结论时返回 None。
+    """
+    status = summary.get("status")
+    passed = status == "pass" or (
+        status == "no_match" and summary.get("recommendation_status") == "not_applicable")
+    if passed:
+        return CHECK_PASSED_LABEL, CHECK_FAILED_LABEL
+    if status in {"partial_match", "no_match"}:
+        return CHECK_FAILED_LABEL, CHECK_PASSED_LABEL
+    return None
+
+
+def _assign_check_label(client: AtomGit, repository: str, number: int, summary: dict) -> dict:
+    """把检查结论写成 Issue 标签。仓库没有该标签或平台拒绝时只记录日志。
+
+    先添加本次结论。添加成功后再移除相反标签，避免仓库缺少新标签时把原标签清掉。
+    移除时平台返回 404 表示 Issue 上本来没有那个标签。任一失败都不抛出，不影响评论和任务完成。
+
+    Args:
+        client: 当前任务使用的 AtomGit 客户端。
+        repository: 目标仓库路径，格式为 owner/repo。
+        number: 仓库内的 Issue 编号。
+        summary: 分析摘要。
+    Returns:
+        label_action 为 assigned、rejected 或 skipped。有结论时还包含 label，即本次要写入的标签名。
+    """
+    labels = _verdict_labels(summary)
+    if labels is None:
+        return {"label_action": "skipped"}
+    wanted, other = labels
+    path = f"/repos/{repository}/issues/{number}/labels"
+    record = {"label": wanted, "label_action": "rejected"}
+    try:
+        client.request("POST", path, [wanted])
+    except IssueProcessingError as exc:
+        LOG.warning("检查标签未写入，任务继续：仓库=%s，Issue=#%s，标签=%s，原因=%s",
+                    repository, number, wanted, exc)
+        return record
+    record["label_action"] = "assigned"
+    try:
+        client.request("DELETE", f"{path}/{other}")
+    except IssueProcessingError as exc:
+        if exc.status_code != 404:
+            LOG.warning("旧检查标签未移除，任务继续：仓库=%s，Issue=#%s，标签=%s，原因=%s",
+                        repository, number, other, exc)
+    return record
+
+
 def _process_issue(config: Config, repository: str, number: int, *, client: AtomGit,
                    checks=None) -> dict:
     """读取 Issue 和模板，按分析决定静默记录或新增、更新评论。
@@ -91,6 +150,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
         或 skipped_unchanged；comment_action 为 created、updated、recovered、suppressed、skipped_closed 或 unchanged。
         执行过分析时还包含 recommendation_status，为模型推荐状态或 None；
         首次读取即发现 Issue 已关闭时不包含该字段。
+        label_action 为 assigned、rejected 或 skipped；分配过标签时包含 label。
     """
     if repository not in config.repositories:
         raise IssueProcessingError("仓库已不在允许接入列表中", retryable=False)
@@ -105,7 +165,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
     if "pull_request" in issue:
         raise IssueProcessingError("该编号对应 Pull Request，不能执行 Issue 检查", retryable=False)
     if issue.get("state") == "closed":
-        return {"status": "skipped_closed", "comment_action": "skipped_closed"}
+        return {"status": "skipped_closed", "comment_action": "skipped_closed", "label_action": "skipped"}
     digest = issue_content_hash(issue)
     with connect(config) as db:
         checked = db.execute("SELECT * FROM issue_checks WHERE repository = ? AND issue_number = ?",
@@ -114,7 +174,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
                              (repository, number)).fetchone()
     # 有未确认发送时，旧的已检查记录不足以证明当前最后一条评论对应最新内容。
     if checked is not None and checked["content_hash"] == digest and pending is None:
-        return {"status": "skipped_unchanged", "comment_action": "unchanged"}
+        return {"status": "skipped_unchanged", "comment_action": "unchanged", "label_action": "skipped"}
     pending_summary = json.loads(pending["summary"]) if pending is not None else {}
     delivery = pending_summary.pop("delivery", {})
     edit_time = _issue_edit_time(issue)
@@ -188,6 +248,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
     latest = client.request("GET", path)
     if latest.get("state") == "closed":
         action = "skipped_closed"
+        extra["label_action"] = "skipped"
     elif issue_content_hash(latest) != digest:
         raise IssueProcessingError("检查期间 Issue 内容已修改，将重新读取并检查")
     else:
@@ -222,6 +283,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
                        (repository, number, digest, saved_marker, saved_time))
             db.execute("DELETE FROM pending_comments WHERE repository = ? AND issue_number = ?",
                        (repository, number))
+        extra.update(_assign_check_label(client, repository, number, summary))
     return {**summary, **extra, "comment_action": action}
 
 
@@ -502,11 +564,15 @@ def _log_success(repository: str, number: int, result: dict, event_id: str) -> N
                "updated": "已更新检查评论",
                "suppressed": "静默处理，未发表评论",
                "skipped_closed": "跳过已关闭的 Issue"}
+    label_actions = {"assigned": "已写入", "rejected": "未写入", "skipped": "未分配"}
     if result.get("maintainer_suggestion_id") is not None:
         statuses["no_match"] = "检查通过，模板覆盖建议已入库"
-    LOG.info("治理处理完成：仓库=%s，Issue=#%s，检查=%s，评论=%s，事件=%s",
+    label_text = label_actions.get(result.get("label_action"), "未分配")
+    if result.get("label"):
+        label_text += " " + result["label"]
+    LOG.info("治理处理完成：仓库=%s，Issue=#%s，检查=%s，评论=%s，标签=%s，事件=%s",
              repository, number, statuses.get(result.get("status"), "已处理"),
-             actions.get(result["comment_action"], "已处理"), event_id[:12])
+             actions.get(result["comment_action"], "已处理"), label_text, event_id[:12])
 
 
 def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client: AtomGit) -> str:
