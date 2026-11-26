@@ -11,6 +11,7 @@ import issue_gov.analysis as analysis
 import issue_gov.checks.tools.compliance.check as compliance_check
 import issue_gov.checks.tools.compliance.comment as compliance_comment
 import issue_gov.checks.tools.compliance.parse as compliance_parse
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 from common.errors import IssueProcessingError
 
@@ -31,19 +32,23 @@ class AnalysisTests(unittest.TestCase):
         Returns:
             None；通过文案、发布决定或建议隔离不正确时测试失败。
         """
+        def review(payload, key, model, base_url):
+            if payload.get("current_template"):
+                return {"template_fit": "correct", "template": payload["current_template"], "reason": "当前模板适用",
+                        "maintainer": None, "alignments": [], "fields": [], "conflicts": []}
+            return {"template_fit": "not_applicable", "template": None, "reason": "模板未覆盖权限申请",
+                    "maintainer": "建议新增权限申请模板", "alignments": [], "fields": [], "conflicts": []}
+
         for title, body, status in (("[Bug] 启动失败", "### 问题描述\n启动失败", "pass"),
                                     ("权限申请", "申请访问仓库", "no_match")):
-            with self.subTest(status=status), patch.object(compliance_recommend, "recommend_template", return_value={
-                    "status": "not_applicable", "reason": "模板未覆盖权限申请", "maintainer": "建议新增权限申请模板"}), patch.object(
-                    compliance_comment, "format_compliance_check", wraps=compliance_comment.format_compliance_check) as format_check:
-                result = analysis.analyze_issue(title, body, [TEMPLATE_FILE], "key",
+            with self.subTest(status=status), patch.object(compliance_assess, "consult", side_effect=review):
+                result = analysis.analyze_issue(title, body, [TEMPLATE_FILE], "key", "model", "https://model.example",
                                                 repository="example/repo", number=18, previously_commented=True)
             self.assertEqual(result["summary"]["status"], status)
             self.assertTrue(result["publish_comment"])
-            self.assertIn("### 提交内容规范性检查：通过", result["comment"])
+            self.assertIn("### 提交内容检查：通过", result["comment"])
             self.assertNotIn("建议新增", result["comment"])
             self.assertEqual(result["maintainer_suggestion"] is not None, status == "no_match")
-            self.assertEqual(format_check.call_count, 1)
 
     def test_matched_issue_does_not_request_recommendation(self):
         """完全或部分匹配时保留检查结果，不调用模板推荐。
@@ -107,32 +112,37 @@ class AnalysisTests(unittest.TestCase):
             None；验证推荐成功、不适用和信息不足均不覆盖基础检查状态。
         """
         for status in ("recommended", "not_applicable", "insufficient_info"):
-            suggestion = {"status": status, "template": "缺陷反馈" if status == "recommended" else None,
+            fit = {"recommended": "wrong", "not_applicable": "not_applicable",
+                   "insufficient_info": "insufficient_info"}[status]
+            suggestion = {"template_fit": fit, "template": "缺陷反馈" if status == "recommended" else None,
                           "reason": "测试推荐结果", "maintainer": (
                               "建议新增申请模板，收集申请账号。"
-                              if status == "not_applicable" else None)}
+                              if status == "not_applicable" else None),
+                          "alignments": [], "fields": [], "conflicts": []}
             with self.subTest(status=status), patch.object(
-                    compliance_recommend, "recommend_template", return_value=suggestion) as recommend:
+                    compliance_assess, "consult", return_value=suggestion) as consult:
                 result = analysis.analyze_issue("启动失败", "退出了", [TEMPLATE_FILE], "key", "model", "https://model.example",
                                                 repository="example/repo", number=18, maintainers=("alice",))
-                self.assertEqual(result["summary"], {"status": "no_match", "recommendation_status": status})
+                self.assertEqual(result["summary"]["status"], "no_match")
+                self.assertEqual(result["summary"]["recommendation_status"], status)
                 if status == "not_applicable":
                     self.assertEqual(result["comment"], "")
+                    self.assertEqual(result["summary"]["label_verdict"], "passed")
                 else:
-                    self.assertIn("### 提交内容规范性检查", result["comment"])
+                    self.assertIn("### 提交内容检查：未通过", result["comment"])
+                    self.assertEqual(result["summary"]["label_verdict"], "failed")
                 self.assertEqual(result["publish_comment"], status != "not_applicable")
                 if status == "not_applicable":
                     self.assertNotIn("给维护者的建议", result["comment"])
                     self.assertNotIn("@alice", result["comment"])
                     saved = result["maintainer_suggestion"]
-                    self.assertEqual(saved, {
-                        "reason": suggestion["reason"],
-                        "suggestion": suggestion["maintainer"],
-                        "mtr": json.dumps(["alice"]),
-                    })
+                    self.assertEqual(saved["reason"], "测试推荐结果")
+                    self.assertEqual(saved["suggestion"], suggestion["maintainer"])
+                    self.assertEqual(json.loads(saved["mtr"]), ["alice"])
                 else:
                     self.assertIsNone(result["maintainer_suggestion"])
-                recommend.assert_called_once_with("启动失败", "退出了", [TEMPLATE], "key", "model", "https://model.example")
+                consult.assert_called_once()
+                self.assertEqual(consult.call_args.args[1:], ("key", "model", "https://model.example"))
 
     def test_refined_documentation_category_passes_without_comment(self):
         """复现 issue-gov-test2 #9 的类别细化，检查通过且不调用模型或生成评论。
@@ -166,10 +176,11 @@ class AnalysisTests(unittest.TestCase):
         Returns:
             None；核对错误可重试且评论生成函数未执行。
         """
-        with patch.object(compliance_recommend, "recommend_template", side_effect=IssueProcessingError("模型响应超时")), patch.object(
+        with patch.object(compliance_assess, "consult", side_effect=IssueProcessingError("模型响应超时")), patch.object(
                 compliance_comment, "format_compliance_check") as format_check:
             with self.assertRaises(IssueProcessingError) as raised:
-                analysis.analyze_issue("未知", "正文", [TEMPLATE_FILE], "key", repository="example/repo", number=11)
+                analysis.analyze_issue("未知", "正文", [TEMPLATE_FILE], "key", "model", "https://model.example",
+                                       repository="example/repo", number=11)
         self.assertTrue(raised.exception.retryable)
         format_check.assert_not_called()
 
@@ -214,7 +225,7 @@ class AnalysisTests(unittest.TestCase):
             check.assert_not_called()
 
     def test_invalid_template_files_save_source_and_diagnosis(self):
-        """本地或公共模板故障说明来源和固定诊断，不用其他模板继续评判 Issue。
+        """损坏的模板记入维护者建议，其余可用模板继续检查。
 
         Args:
             无。
@@ -231,11 +242,12 @@ class AnalysisTests(unittest.TestCase):
             for filename, content, message in cases:
                 source = owner + "/.gitcode/ISSUE_TEMPLATE/" + filename
                 files = [TEMPLATE_FILE, {"filename": filename, "source": source, "content": content}]
-                with self.subTest(source=source, content=content), patch.object(compliance_recommend, "recommend_template") as recommend, patch.object(
-                        compliance_check, "check_issue") as check:
+                with self.subTest(source=source, content=content), patch.object(
+                        compliance_recommend, "recommend_template") as recommend:
                     result = analysis.analyze_issue("标题", "正文", files, "key", repository="example/repo", number=18,
                                                     maintainers=("alice",))
-                self.assertEqual(result["summary"]["status"], "template_error")
+                self.assertEqual(result["summary"]["status"], "no_match")
+                self.assertEqual(result["summary"]["label_verdict"], "unchanged")
                 self.assertFalse(result["publish_comment"])
                 self.assertEqual(result["comment"], "")
                 saved = result["maintainer_suggestion"]
@@ -244,7 +256,6 @@ class AnalysisTests(unittest.TestCase):
                 self.assertEqual(json.loads(saved["mtr"]), ["alice"])
                 self.assertNotIn("private-template-value", saved["reason"])
                 recommend.assert_not_called()
-                check.assert_not_called()
 
     def test_template_diagnostics_save_all_files_with_configured_recipients(self):
         """多个故障文件一并记录，接收人只来自配置。

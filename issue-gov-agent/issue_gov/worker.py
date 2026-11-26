@@ -80,16 +80,24 @@ def _save_maintainer_suggestion(db, repository: str, number: int, suggestion: di
 
 
 def _verdict_labels(summary: dict) -> tuple[str, str] | None:
-    """按规范性检查结论选择要写入的标签，以及需要去掉的相反标签。
+    """按检查结论选择要写入的标签，以及需要去掉的相反标签。
 
-    通过、以及未匹配但推荐认为不适用，使用 issue-check-passed。
-    部分匹配和其余未匹配使用 issue-check-failed。模板故障、关闭和未变化没有结论，不改标签。
+    摘要里的 label_verdict 优先。没有该字段时，通过、以及未匹配但推荐认为不适用，
+    使用 issue-check-passed。部分匹配和其余未匹配使用 issue-check-failed。
+    模板故障、关闭和未变化没有结论时不改标签。
 
     Args:
-        summary: 分析摘要，包含 status，未匹配时还包含 recommendation_status。
+        summary: 分析摘要。可包含 label_verdict、status 和 recommendation_status。
     Returns:
         (要添加的标签, 要移除的相反标签)；没有结论时返回 None。
     """
+    verdict = summary.get("label_verdict")
+    if verdict == "passed":
+        return CHECK_PASSED_LABEL, CHECK_FAILED_LABEL
+    if verdict == "failed":
+        return CHECK_FAILED_LABEL, CHECK_PASSED_LABEL
+    if verdict == "unchanged":
+        return None
     status = summary.get("status")
     passed = status == "pass" or (
         status == "no_match" and summary.get("recommendation_status") == "not_applicable")

@@ -17,7 +17,7 @@ receiver（可多进程）
     ▼
 PostgreSQL ◀──────── consumer × N（竞争消费）
     ▲                    │
-    │                    ├─ 读取 Issue、检查、必要时调用模型
+    │                    ├─ 读取 Issue、做程序检查；已配置模型时确认模板、内容和正文是否自洽
     │                    ├─ 成功：更新任务并写入 reports
     │                    └─ 全部模型密钥失败：标记 failed，消息进入死信队列
 RabbitMQ

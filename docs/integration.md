@@ -6,9 +6,9 @@
 
 ## 服务介绍
 
-服务接收 AtomGit / GitCode 的 Issue Webhook，检查标题和正文是否符合仓库 Issue 模板，必要时调用模型推荐模板，然后在 Issue 上发表或更新一条评论，并按结论写入检查标签。
+服务接收 AtomGit / GitCode 的 Issue Webhook，检查标题和正文是否符合仓库 Issue 模板，由模型确认模板是否用对、必填内容是否提供、正文是否自相矛盾，然后在 Issue 上发表或更新一条评论，并按结论写入检查标签。
 
-它不判断问题是否真实、分类是否正确或信息是否充分。同一 Issue 同时只有一条活跃任务。新通知会把尚未完成的旧任务标为 `superseded`。
+它不判断问题是否真实，也不对照仓库代码。正确性只核对同一 Issue 内部的陈述能否自洽。同一 Issue 同时只有一条活跃任务。新通知会把尚未完成的旧任务标为 `superseded`。
 
 ```text
 GitCode Issue 事件
@@ -20,7 +20,7 @@ GitCode Issue 事件
 RabbitMQ  issue.analysis
     │
 消费者 consumer × N
-    │  读取 Issue 和模板、检查、必要时调用模型
+    │  读取 Issue 和模板、做程序检查；已配置模型时确认模板、内容和正文是否自洽
     │  发表或更新一条评论，并写入检查标签
     ▼
 PostgreSQL  events / reports
@@ -30,14 +30,23 @@ PostgreSQL  events / reports
 
 | 情况 | 检查状态 | 评论 | 标签 |
 | --- | --- | --- | --- |
-| 完整匹配 | `pass` | 此前没有评论则不发；已有评论则更新为通过 | `issue-check-passed` |
-| 部分匹配 | `partial_match` | 指出缺项，并给出可复制模板 | `issue-check-failed` |
-| 未匹配且推荐出模板 | `no_match` | 给出推荐理由和该模板 | `issue-check-failed` |
-| 未匹配且信息不足 | `no_match` | 列出全部模板，要求补充信息 | `issue-check-failed` |
-| 未匹配且现有模板不适用 | `no_match`，`recommendation_status=not_applicable` | 不发评论；建议写入维护者建议表 | `issue-check-passed` |
-| 模板缺失或无法解析 | `template_error` | 不发评论；建议写入维护者建议表 | 不改标签 |
+| 模板用对，必填内容齐全，正文无冲突 | `pass` | 此前没有评论则不发；已有评论则更新为通过 | `issue-check-passed` |
+| 模板用对，但有必填内容缺失、选项非法、必选未勾选或正文冲突 | `partial_match` | 只列出有问题的项 | `issue-check-failed` |
+| 模板用错，已选出应改用的模板 | `no_match` | 说明原因并给出该模板 | `issue-check-failed` |
+| 未使用模板，已选出应使用的模板 | `no_match` | 说明原因并给出该模板 | `issue-check-failed` |
+| 未使用模板，信息不足以选择 | `no_match` | 列出全部模板，要求补充诉求 | `issue-check-failed` |
+| 现有模板都不适用 | `no_match`，`recommendation_status=not_applicable` | 不发评论；建议写入维护者建议表 | `issue-check-passed` |
+| 仓库没有可用模板，正文无冲突 | `template_error` | 不发评论；模板问题写入维护者建议表 | `issue-check-passed` |
+| 仓库没有可用模板，正文有冲突 | `template_error` | 只写冲突，不提模板 | `issue-check-failed` |
+| 未配置模型时完整匹配 | `pass` | 此前没有评论则不发；已有评论则更新为通过 | `issue-check-passed` |
+| 未配置模型时部分匹配 | `partial_match` | 指出缺项，并给出可复制模板 | `issue-check-failed` |
+| 未配置模型且未匹配模板 | `no_match` | 不发评论 | 不改标签 |
 | 内容与上次检查相同 | `skipped_unchanged` | 不重复处理 | 不改标签 |
 | Issue 已关闭 | `skipped_closed` | 不处理 | 不改标签 |
+
+模板用错时只回复该用哪份模板，不再列出结构、必填内容和正文冲突。改对模板后再次检查。章节标题用词不同但内容已经写清时，算作已提供。标题前缀不一致只记录，不单独造成失败。
+
+模型超时、鉴权失败或输出无法识别时，任务按原有退避重试；密钥全部失败时进入死信队列。
 
 相邻两次修改间隔不超过 3 分钟且已有本服务评论时，更新原评论。仓库没有模板时，回退读取所属组织 `.gitcode` 仓库默认分支中的公共模板。
 
@@ -49,10 +58,11 @@ PostgreSQL  events / reports
 | --- | --- |
 | `status` | 上表中的检查状态 |
 | `comment_action` | `created` 已发新评论，`updated` 已更新评论，`recovered` 已找到先前评论，`suppressed` 未发评论，`unchanged` 内容未变，`skipped_closed` 已关闭 |
-| `recommendation_status` | 模型推荐状态；未调用模型时可能为空 |
+| `recommendation_status` | 模型选择模板的状态；未调用模型或模板已用对时为空 |
 | `label` | `issue-check-passed` 或 `issue-check-failed`；未分配时没有该字段 |
 | `label_action` | `assigned` 已写入，`rejected` 平台拒绝，`skipped` 本次未分配 |
 | `maintainer_suggestion_id` | 写入维护者建议时的记录编号 |
+| `assessment` | 调用模型时的评估明细：`template_fit`、字段结论、冲突和结构问题 |
 
 任务状态还有 `queued`、`dispatching`、`running`、`failed`。可重试错误最多 5 次。模型密钥全部失败时任务变为 `failed`，并进入死信队列 `issue.analysis.dlq`。失败原因在 `events.last_error`。
 
@@ -78,7 +88,7 @@ owner/another-repo: []
 | --- | --- |
 | `WEBHOOK_SECRET` | Webhook 密码，对应请求头 `X-GitCode-Token` |
 | `ATOMGIT_TOKEN` | 读取 Issue、模板和发表评论的服务账号令牌 |
-| `AGENT_API_KEY` 或 `AGENT_API_KEYS` | 模型密钥。多个密钥用英文逗号分隔 |
+| `AGENT_API_KEY` 或 `AGENT_API_KEYS` | 模型密钥。多个密钥用英文逗号分隔。配置后模型参与每次检查；不配置时只做程序的模板匹配 |
 | `LLM_BASE_URL` | 模型服务地址 |
 | `LLM_MODEL` | 模型名 |
 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB` | 数据库账号。口令只用字母和数字 |

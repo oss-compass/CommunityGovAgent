@@ -17,6 +17,7 @@ def compliance_dir():
 
 RULES_FILE = compliance_dir() / "rules.yml"
 RECOMMEND_PROMPT = compliance_dir() / "recommend_template.md"
+ASSESS_PROMPT = compliance_dir() / "assess_prompt.md"
 COMMENT_TEMPLATES = compliance_dir() / "comment_templates.yml"
 
 

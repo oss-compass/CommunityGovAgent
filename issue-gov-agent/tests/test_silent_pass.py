@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
 import common.atomgit as atomgit
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
@@ -41,6 +42,14 @@ class SilentPassTests(unittest.TestCase):
         self.publish = self.enterContext(patch.object(self.client, "create_comment", side_effect=AssertionError("Passing checks must not post")))
         self.lookup = self.enterContext(patch.object(self.client, "has_comment", side_effect=AssertionError("No pending comment lookup")))
         self.recommend = self.enterContext(patch.object(compliance_recommend, "recommend_template", return_value=deepcopy(GAP)))
+        self.consult = self.enterContext(patch.object(compliance_assess, "consult", side_effect=self.model_review))
+
+    def model_review(self, payload, key, model, base_url):
+        if payload.get("current_template"):
+            return {"template_fit": "correct", "template": payload["current_template"], "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": [], "conflicts": []}
+        return {"template_fit": "not_applicable", "template": None, "reason": GAP["reason"],
+                "maintainer": GAP["maintainer"], "alignments": [], "fields": [], "conflicts": []}
         self.enterContext(patch.object(atomgit, "build_opener", side_effect=AssertionError("No live network")))
 
     def rows(self, table):
@@ -87,7 +96,8 @@ class SilentPassTests(unittest.TestCase):
         self.lookup.assert_not_called()
         self.assertEqual(self.rows("pending_comments"), [])
         self.assertEqual(self.process()["status"], "skipped_unchanged")
-        self.recommend.assert_called_once()
+        self.consult.assert_called()
+        self.recommend.assert_not_called()
 
     def test_completed_check_is_not_repeated_and_new_checks_keep_suggestions(self):
         first = self.process()["maintainer_suggestion_id"]
@@ -174,7 +184,9 @@ class SilentPassTests(unittest.TestCase):
         self.assertEqual(self.rows("issue_checks"), checked)
 
     def test_missing_maintenance_is_retried_instead_of_silently_lost(self):
-        self.recommend.return_value = {**GAP, "maintainer": None}
+        self.consult.side_effect = lambda payload, key, model, base_url: {
+            "template_fit": "not_applicable", "template": None, "reason": GAP["reason"],
+            "maintainer": None, "alignments": [], "fields": [], "conflicts": []}
         self.post()
         worker.process_one(self.config, now=100, client=self.client)
         self.assertEqual(self.rows("events")[0]["state"], "queued")

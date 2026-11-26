@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import issue_gov.analysis as analysis
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.check as compliance_check
 import issue_gov.checks.tools.compliance.comment as compliance_comment
 import issue_gov.checks.tools.compliance.parse as compliance_parse
@@ -123,22 +124,22 @@ class KeyFailoverTests(unittest.TestCase):
     def test_success_on_next_key_stops_rotation(self):
         calls = []
 
-        def recommend(title, body, templates, key, model, base_url):
+        def consult(payload, key, model, base_url):
             calls.append(key)
             if key == "key-a":
                 raise IssueProcessingError("模型响应超时")
-            return {"status": "recommended", "template": "缺陷", "reason": "匹配", "maintainer": None}
+            return {"template_fit": "wrong", "template": "缺陷", "reason": "匹配", "maintainer": None,
+                    "alignments": [], "fields": [], "conflicts": []}
 
         template = {"name": "缺陷", "title": "[Bug] ", "body": [
             {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}}]}
         with patch.object(compliance_parse, "parse_template", return_value=template), patch.object(
                 compliance_check, "check_issue", return_value={"status": "no_match", "matched_templates": [], "checks": []}), \
-                patch.object(compliance_recommend, "recommend_template", side_effect=recommend), patch.object(
-                compliance_tool.time, "sleep") as pause, patch.object(
-                compliance_comment, "format_compliance_check", return_value="评论"):
+                patch.object(compliance_assess, "consult", side_effect=consult), patch.object(
+                compliance_tool.time, "sleep") as pause:
             result = analysis.analyze_issue(
                 "未知", "正文", [{"filename": "a.yml", "source": "s", "content": "x"}],
-                "ignored", repository="example/project", number=2,
+                "ignored", "model", "https://models.example", repository="example/project", number=2,
                 agent_api_keys=("key-a", "key-b"), llm_key_retries=2, llm_key_retry_interval=10)
         self.assertEqual(calls, ["key-a", "key-a", "key-a", "key-b"])
         self.assertEqual(pause.call_count, 2)

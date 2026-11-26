@@ -9,6 +9,7 @@ import yaml
 
 from common.errors import ProcessingError
 from issue_gov.checks.base import COMPLIANCE, is_default_checks
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.check as compliance_check
 import issue_gov.checks.tools.compliance.comment as compliance_comment
 import issue_gov.checks.tools.compliance.parse as compliance_parse
@@ -36,26 +37,23 @@ def should_publish_comment(summary: dict, *, previously_commented: bool = False)
     return True
 
 
-def _recommend(
-    title: str, body: str, templates: list[dict[str, Any]],
-    agent_api_key: str, model: str, base_url: str,
-    agent_api_keys: tuple[str, ...] | None, retries: int, interval: float,
-) -> dict[str, Any]:
-    """调用模板推荐。未提供密钥列表时保持单次调用；提供时按密钥轮换。
+def _call_model(operation, agent_api_key: str, model: str, base_url: str,
+                agent_api_keys: tuple[str, ...] | None, retries: int, interval: float):
+    """调用模型。未提供密钥列表时只调用一次；提供时按密钥轮换。
 
-    鉴权失败立即换下一个密钥。超时和进程启动失败按间隔重试当前密钥，用尽后再切换。
-    结果格式不对只重试调用，不计入密钥耗尽，也不因此进入死信。
-    配置缺失立即失败，不占用重试间隔。密钥本身全部失败后标记 keys_exhausted。
+    operation 接收当前密钥、模型名和接口地址。鉴权失败立即换下一个密钥。
+    超时和进程启动失败按间隔重试当前密钥，用尽后再切换。结果格式不对只重试调用，
+    不计入密钥耗尽。配置缺失立即失败。密钥全部失败后标记 keys_exhausted。
     """
     if not agent_api_keys:
-        return compliance_recommend.recommend_template(title, body, templates, agent_api_key, model, base_url)
+        return operation(agent_api_key, model, base_url)
     last: ProcessingError | None = None
     invalid_attempts = 0
     for index, key in enumerate(agent_api_keys, start=1):
         attempt = 0
         while True:
             try:
-                return compliance_recommend.recommend_template(title, body, templates, key, model, base_url)
+                return operation(key, model, base_url)
             except ProcessingError as exc:
                 if "未配置" in str(exc):
                     raise
@@ -77,6 +75,60 @@ def _recommend(
         if index < len(agent_api_keys):
             LOG.warning("模型密钥连续失败，切换下一个密钥：序号=%s/%s，原因=%s", index, len(agent_api_keys), last)
     raise ProcessingError("全部模型密钥均调用失败", retryable=False, keys_exhausted=True) from None
+
+
+def _recommend(
+    title: str, body: str, templates: list[dict[str, Any]],
+    agent_api_key: str, model: str, base_url: str,
+    agent_api_keys: tuple[str, ...] | None, retries: int, interval: float,
+) -> dict[str, Any]:
+    """调用模板推荐。保留给仍直接依赖推荐入口的测试和调用方。"""
+    return _call_model(
+        lambda key, model_name, url: compliance_recommend.recommend_template(
+            title, body, templates, key, model_name, url),
+        agent_api_key, model, base_url, agent_api_keys, retries, interval)
+
+
+def _suggestion(problems: list[dict[str, str]], extra: dict[str, str] | None,
+                maintainers: tuple[str, ...]) -> dict[str, Any] | None:
+    """合并模板配置问题和维护者建议。没有内容时不入库。"""
+    reasons = [f"{item['source']}：{item['message']}" for item in problems]
+    suggestions = ["请修复上述仓库模板配置问题。"] if problems else []
+    if extra:
+        if extra.get("reason"):
+            reasons.append(extra["reason"])
+        if extra.get("suggestion"):
+            suggestions.append(extra["suggestion"])
+    if not reasons:
+        return None
+    return {"reason": "\n".join(reasons), "suggestion": "\n".join(suggestions),
+            "mtr": json.dumps(maintainers, ensure_ascii=False)}
+
+
+def _legacy_result(program: dict[str, Any], templates: list[dict[str, Any]], problems: list[dict[str, str]],
+                   maintainers: tuple[str, ...], previously_commented: bool) -> dict[str, Any]:
+    """模型不可用时沿用程序结论。未匹配模板时不发评论，也不改标签。"""
+    if program["status"] == "template_error":
+        summary = {"status": "template_error", "recommendation_status": None}
+        return {"summary": summary, "comment": "", "publish_comment": False,
+                "maintainer_suggestion": _suggestion(problems, None, maintainers)}
+    if program["status"] == "no_match":
+        summary = {"status": "no_match", "recommendation_status": None, "label_verdict": "unchanged"}
+        return {"summary": summary, "comment": "", "publish_comment": False,
+                "maintainer_suggestion": _suggestion(problems, None, maintainers)}
+    summary = {"status": program["status"], "recommendation_status": None}
+    publish_comment = should_publish_comment(summary, previously_commented=previously_commented)
+    comment = compliance_comment.format_compliance_check(program, templates=templates) if publish_comment else ""
+    return {"summary": summary, "comment": comment, "publish_comment": publish_comment,
+            "maintainer_suggestion": _suggestion(problems, None, maintainers)}
+
+
+def _ask_model(payload: dict[str, Any], agent_api_key: str, model: str, base_url: str,
+               agent_api_keys: tuple[str, ...] | None, retries: int, interval: float) -> dict[str, Any]:
+    """调用评估。超时、鉴权失败和无效输出沿用密钥轮换与任务重试。"""
+    return _call_model(
+        lambda key, model_name, url: compliance_assess.consult(payload, key, model_name, url),
+        agent_api_key, model, base_url, agent_api_keys, retries, interval)
 
 
 def analyze_issue(
@@ -108,41 +160,54 @@ def analyze_issue(
                                       "message": "YAML 语法无效，请检查缩进、引号、括号及标签。"})
         except ValueError as exc:
             template_problems.append({"source": file["source"], "message": str(exc)})
-    if template_problems:
-        result = {"status": "template_error", "template_problems": template_problems}
+    configured = compliance_assess.model_configured(
+        agent_api_key, model, base_url, agent_api_keys)
+    if not templates:
+        if not configured:
+            return _legacy_result({"status": "template_error"}, [], template_problems, maintainers, previously_commented)
+        payload = compliance_assess.review_payload(title, body, [], None)
+        raw = _ask_model(payload, agent_api_key, model, base_url, agent_api_keys,
+                         llm_key_retries, llm_key_retry_interval)
+        reviewed = compliance_assess.decide_review(
+            None, [], raw, payload["issue"]["segments"], template_problems)
+        if reviewed.get("fallback"):
+            raise ProcessingError("模型未返回有效的评估结果，未能完成内容评估。", failure="invalid_output")
+        suggestion = _suggestion(template_problems, None, maintainers)
+        if not reviewed.get("conflicts"):
+            summary = {"status": "template_error", "recommendation_status": None, "label_verdict": "passed",
+                       "assessment": {"correctness": "pass", "fallback": None}}
+            return {"summary": summary, "comment": "", "publish_comment": False,
+                    "maintainer_suggestion": suggestion}
+        decision = {"comment_kind": "conflict", "comment_parts": {"conflicts": reviewed["conflicts"]}}
+        summary = {"status": "template_error", "recommendation_status": None, "label_verdict": "failed",
+                   "assessment": {"correctness": "conflict", "conflicts": reviewed["conflicts"], "fallback": None}}
+        return {"summary": summary, "comment": compliance_comment.format_decision(decision),
+                "publish_comment": True, "maintainer_suggestion": suggestion}
+
+    program = compliance_check.check_issue(title, body, templates)
+    if not configured:
+        return _legacy_result(program, templates, template_problems, maintainers, previously_commented)
+    payload = compliance_assess.review_payload(title, body, templates, program)
+    raw = _ask_model(payload, agent_api_key, model, base_url, agent_api_keys,
+                     llm_key_retries, llm_key_retry_interval)
+    decision = compliance_assess.decide_review(
+        program, templates, raw, payload["issue"]["segments"], template_problems)
+    if decision.get("fallback"):
+        raise ProcessingError("模型未返回有效的评估结果，未能完成内容评估。", failure="invalid_output")
+    kind = decision["comment_kind"]
+    passed_notice = decision["label_verdict"] == "passed" and kind in {"pass", "none"}
+    publish_comment = (passed_notice and previously_commented) or kind in {
+        "template", "insufficient", "issues", "conflict"}
+    if passed_notice and previously_commented:
+        comment = compliance_comment.format_decision({**decision, "comment_kind": "pass"}, templates=templates)
+    elif publish_comment:
+        comment = compliance_comment.format_decision(decision, templates=templates)
     else:
-        result = compliance_check.check_issue(title, body, templates)
-    if result["status"] == "no_match":
-        result["recommendation"] = _recommend(
-            title, body, templates, agent_api_key, model, base_url,
-            agent_api_keys, llm_key_retries, llm_key_retry_interval)
-    recommendation = result.get("recommendation", {})
-    maintainer_suggestion = None
-    if result["status"] == "template_error":
-        maintainer_suggestion = {
-            "reason": "\n".join(f"{p['source']}：{p['message']}" for p in template_problems),
-            "suggestion": "请修复上述仓库模板配置问题。",
-            "mtr": json.dumps(maintainers, ensure_ascii=False),
-        }
-    elif result["status"] == "no_match" and recommendation.get("status") == "not_applicable":
-        maintainer_suggestion = {
-            "reason": recommendation["reason"],
-            "suggestion": recommendation["maintainer"],
-            "mtr": json.dumps(maintainers, ensure_ascii=False),
-        }
-
-    summary = {"status": result["status"], "recommendation_status": recommendation.get("status")}
-    publish_comment = should_publish_comment(summary, previously_commented=previously_commented)
-    comment = ""
-    if publish_comment:
-        comment = compliance_comment.format_compliance_check(result, templates=templates)
-
-    return {
-        "summary": summary,
-        "comment": comment,
-        "publish_comment": publish_comment,
-        "maintainer_suggestion": maintainer_suggestion,
-    }
+        comment = ""
+    summary = {"status": decision["status"], "recommendation_status": decision["recommendation_status"],
+               "label_verdict": decision["label_verdict"], "assessment": decision["assessment"]}
+    return {"summary": summary, "comment": comment, "publish_comment": publish_comment,
+            "maintainer_suggestion": _suggestion(template_problems, decision.get("maintainer"), maintainers)}
 
 
 class ComplianceTool:

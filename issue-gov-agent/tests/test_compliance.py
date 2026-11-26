@@ -92,7 +92,7 @@ class ComplianceTests(unittest.TestCase):
                 compliance_recommend.recommend_template(
                     "未知", "描述", [TEMPLATE], "agent-key", "custom-model", "https://models.example")
         self.assertTrue(raised.exception.retryable)
-        self.assertIn("推荐程序运行失败", str(raised.exception))
+        self.assertIn("模型程序运行失败", str(raised.exception))
         self.assertNotIn(TOKEN, str(raised.exception))
         self.assertNotIn("agent-key", str(raised.exception))
         self.assertTrue(compliance_recommend.RECOMMEND_PROMPT.is_file())
@@ -274,7 +274,7 @@ class ComplianceTests(unittest.TestCase):
                     compliance_recommend.recommend_template("未知", "正文", [TEMPLATE], "agent-key", "model", "https://models.example")
             self.assertTrue(raised.exception.retryable)
             self.assertEqual(raised.exception.failure, "invalid_output")
-            self.assertIn("模型未返回有效的推荐结果", str(raised.exception))
+            self.assertIn("未能完成模板推荐", str(raised.exception))
             self.assertNotIn("agent-key", str(raised.exception))
             self.assertNotIn(TOKEN, str(raised.exception))
 

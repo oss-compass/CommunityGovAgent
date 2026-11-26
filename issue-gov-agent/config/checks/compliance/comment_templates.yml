@@ -4,6 +4,27 @@
 passed: |-
   ### 提交内容规范性检查：通过
 
+review_passed: |-
+  ### 提交内容检查：通过
+
+review_template: |-
+  ### 提交内容检查：未通过
+
+  #### 模板
+  {reason}
+
+  请改用 {name}。
+
+  {template}
+
+review_insufficient: |-
+  ### 提交内容检查：未通过
+
+  #### 模板
+  {reason}
+
+  {templates}
+
 # 部分匹配
 partial_match: |-
   ### 提交内容规范性检查：未通过

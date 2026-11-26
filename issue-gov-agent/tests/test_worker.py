@@ -13,9 +13,11 @@ import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 co
 import common.atomgit as atomgit
 from common.errors import IssueProcessingError
 import issue_gov.worker as worker
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import issue_gov.receiver as receiver
 
+REAL_CONSULT = compliance_assess.consult
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
     {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}}]}
 ISSUE = {"title": "[Bug] 崩溃", "body": "### 问题描述\n启动后退出", "state": "open"}
@@ -38,6 +40,24 @@ class WorkerTests(unittest.TestCase):
         guard = patch.object(atomgit, "build_opener", side_effect=AssertionError("No live requests"))
         guard.start()
         self.addCleanup(guard.stop)
+        consulted = patch.object(compliance_assess, "consult", side_effect=self.model_review)
+        consulted.start()
+        self.addCleanup(consulted.stop)
+
+    def model_review(self, payload, key, model, base_url):
+        """默认模型结论：沿用程序选定的模板，待定必填字段视为未提供。"""
+        if payload.get("mode") == "conflicts":
+            return {"conflicts": []}
+        current = payload.get("current_template")
+        templates = payload.get("templates") or []
+        if not current:
+            return {"template_fit": "wrong", "template": templates[0]["name"] if templates else None,
+                    "reason": "适合描述当前问题", "maintainer": None, "alignments": [], "fields": [],
+                    "conflicts": []}
+        return {"template_fit": "correct", "template": current, "reason": "当前模板适用", "maintainer": None,
+                "alignments": [], "fields": [
+                    {"field": item["label"], "status": "absent", "evidence": [], "ask": "请补充这项内容"}
+                    for item in payload.get("pending_fields") or []], "conflicts": []}
 
     def responses(self, issue=ISSUE, latest=None):
         """按完整处理流程的请求顺序构造模拟 AtomGit 响应。
@@ -144,8 +164,8 @@ class WorkerTests(unittest.TestCase):
         cases = (
             ("question.md", "### 问题描述\n请填写", ISSUE, "pass", "通过模板规范检查"),
             ("question.md", "### 问题描述\n请填写", {**ISSUE, "body": "### 问题描述\n请填写"},
-             "partial_match", "此必填章节为空或仅含占位内容"),
-            ("question.md", "请填写问题描述", ISSUE, "no_match", "未匹配现有模板"),
+             "partial_match", "请补充这项内容"),
+            ("question.md", "请填写问题描述", ISSUE, "no_match", "适合描述当前问题"),
             ("check.yml", yaml.safe_dump({"name": "确认", "title": "[Bug] ", "body": [
                 {"type": "checkboxes", "attributes": {"label": "确认项", "options": [
                     {"label": "已阅读说明", "required": True}]}}]}),
@@ -171,10 +191,9 @@ class WorkerTests(unittest.TestCase):
                                    if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
                     self.assertIn(message, comment)
                 if status == "no_match":
-                    model.assert_called_once()
                     self.assertEqual(result["recommendation_status"], "recommended")
-                    self.assertIn("#### 模板推荐：", comment)
-                    self.assertIn("提交内容规范性检查：未通过", comment)
+                    self.assertIn("#### 模板", comment)
+                    self.assertIn("提交内容检查：未通过", comment)
                 else:
                     model.assert_not_called()
 
@@ -277,15 +296,15 @@ class WorkerTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
-        recommendation = {"status": "recommended", "template": "缺陷反馈", "reason": "运行异常"}
         with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))) as api, patch.object(
-            compliance_recommend, "recommend_template", return_value=recommendation) as model:
+            compliance_assess, "consult", return_value={"template_fit": "wrong", "template": "缺陷反馈",
+                "reason": "运行异常", "maintainer": None, "alignments": [], "fields": [], "conflicts": []}) as model:
             result = worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(model.call_args.args[-3:], ("model-key", "custom-model", "https://models.example"))
         self.assertEqual(result["recommendation_status"], "recommended")
         comment = next(c.args[2]["body"] for c in api.call_args_list
                        if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
-        self.assertIn("#### 模板推荐：", comment)
+        self.assertIn("#### 模板", comment)
         self.assertIn("**模板正文（Markdown）**", comment)
         self.assertNotIn("崩溃了", comment)
         self.assertNotIn("启动失败", comment)
@@ -298,8 +317,9 @@ class WorkerTests(unittest.TestCase):
         responses[3] = {"encoding": "base64", "content": base64.b64encode(
             yaml.safe_dump(documentation).encode()).decode()}
         with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(responses)) as api, patch.object(
-            compliance_recommend, "recommend_template", return_value={"status": "not_applicable", "reason": "没有适合的模板",
-                "maintainer": "现有模板仅覆盖文档，建议新增工具缺陷反馈模板，收集问题描述和复现步骤。"},
+            compliance_assess, "consult", return_value={"template_fit": "not_applicable", "template": None,
+                "reason": "没有适合的模板", "maintainer": "现有模板仅覆盖文档，建议新增工具缺陷反馈模板，收集问题描述和复现步骤。",
+                "alignments": [], "fields": [], "conflicts": []},
         ) as model:
             result = worker._process_issue(self.config, "example/repo", 12,
                                           client=atomgit.AtomGit(self.config.token, request_interval=0))
@@ -330,7 +350,9 @@ class WorkerTests(unittest.TestCase):
                           "maintainer": "建议新增成员申请模板，收集申请账号。"}
         client = atomgit.AtomGit(config.token, request_interval=0)
         with patch.object(client, "request", side_effect=self.replay(self.responses(issue)[:-1] * 3)) as api, patch.object(
-                compliance_recommend, "recommend_template", return_value=recommendation):
+                compliance_assess, "consult", return_value={
+                    "template_fit": "not_applicable", "template": None, "reason": recommendation["reason"],
+                    "maintainer": recommendation["maintainer"], "alignments": [], "fields": [], "conflicts": []}):
             for repository in repositories:
                 worker._process_issue(config, repository, 12, client=client)
         self.assertTrue(all(c.args[0] == "GET" or "/labels" in c.args[1] for c in api.call_args_list))
@@ -363,9 +385,11 @@ class WorkerTests(unittest.TestCase):
         """
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
         with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))) as api:
-            with self.assertRaises(IssueProcessingError) as raised:
-                worker._process_issue(replace(self.config, agent_api_key=""), "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
-        self.assertTrue(raised.exception.retryable)
+            result = worker._process_issue(replace(self.config, agent_api_key=""), "example/repo", 12,
+                                           client=atomgit.AtomGit(self.config.token, request_interval=0))
+        self.assertEqual(result["status"], "no_match")
+        self.assertEqual(result["label_verdict"], "unchanged")
+        self.assertEqual(result["comment_action"], "suppressed")
         self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
 
     def test_edit_during_analysis_retries_without_stale_comment(self):
@@ -455,7 +479,8 @@ class WorkerTests(unittest.TestCase):
                    "object_attributes": {"iid": 12, "action": "open"}}
         issue = {**ISSUE, "title": "未知", "body": "正文"}
         files = [{"filename": "bug.yml", "source": "example/repo/bug.yml", "content": yaml.safe_dump(TEMPLATE)}]
-        suggestion = {"status": "recommended", "template": "缺陷反馈", "reason": "运行失败", "maintainer": None}
+        suggestion = {"template_fit": "wrong", "template": "缺陷反馈", "reason": "运行失败",
+                      "maintainer": None, "alignments": [], "fields": [], "conflicts": []}
         output = json.dumps({"type": "result", "subtype": "success", "is_error": False,
                              "result": json.dumps(suggestion)})
         for failure in ("timeout", "startup", "invalid_json", "missing_key", "missing_model", "missing_url"):
@@ -475,6 +500,7 @@ class WorkerTests(unittest.TestCase):
                 client = atomgit.AtomGit(config.token, request_interval=0)
                 with patch.object(client, "request", return_value=issue), patch.object(client, "templates", return_value=files), patch.object(
                         client, "create_comment", return_value="created") as publish, patch.object(
+                        compliance_assess, "consult", REAL_CONSULT), patch.object(
                         compliance_recommend.subprocess, "Popen") as popen, patch.object(compliance_recommend.os, "killpg"):
                     process = popen.return_value.__enter__.return_value
                     process.returncode = 0
@@ -483,6 +509,14 @@ class WorkerTests(unittest.TestCase):
                         process.communicate.side_effect = compliance_recommend.subprocess.TimeoutExpired("claude", compliance_recommend.LLM_TIMEOUT)
                     elif failure == "startup":
                         popen.side_effect = OSError("model-key platform-key")
+                    if failure.startswith("missing_"):
+                        self.assertTrue(worker.process_one(config, now=100, client=client))
+                        row = receiver.queue_snapshot(config)["recent"][0]
+                        self.assertEqual(row["state"], "completed")
+                        self.assertEqual(json.loads(row["result"])["comment_action"], "suppressed")
+                        publish.assert_not_called()
+                        popen.assert_not_called()
+                        continue
                     with self.assertLogs(worker.LOG, level="WARNING") as logs:
                         self.assertTrue(worker.process_one(config, now=100, client=client))
                     row = receiver.queue_snapshot(config)["recent"][0]
@@ -504,7 +538,8 @@ class WorkerTests(unittest.TestCase):
                     self.assertIsNone(row["last_error"])
                     self.assertEqual(json.loads(row["result"])["recommendation_status"], "recommended")
                     publish.assert_called_once()
-                    self.assertIn("#### 模板推荐：缺陷反馈", publish.call_args.args[2])
+                    self.assertIn("#### 模板", publish.call_args.args[2])
+                    self.assertIn("请改用 缺陷反馈", publish.call_args.args[2])
                     self.assertNotIn("模板推荐未完成", publish.call_args.args[2])
 
     def test_shared_client_reuses_templates_across_queued_events(self):

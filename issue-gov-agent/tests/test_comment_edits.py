@@ -1,5 +1,6 @@
 """三分钟窗口、首次静默及修改后通过通知的事务恢复测试；不访问网络。"""
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import issue_gov.analysis as analysis
+import issue_gov.checks.tools.compliance.assess as compliance_assess
 import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import common.atomgit as atomgit
 import issue_gov.receiver as receiver
@@ -155,11 +157,13 @@ class CommentEditTests(unittest.TestCase):
             self.assertIn('提交内容规范性检查：通过', self.comments[1]['body'])
             self.edit(200, 'gap')
             self.issue['title'] = '权限申请'
-            with patch.object(compliance_recommend, 'recommend_template', return_value={
-                    'status': 'not_applicable', 'reason': '模板未覆盖权限申请',
-                    'maintainer': '建议新增权限申请模板'}):
+            self.config = replace(self.config, agent_api_key='key', llm_model='model',
+                                  llm_base_url='https://model.example')
+            with patch.object(compliance_assess, 'consult', return_value={
+                    'template_fit': 'not_applicable', 'template': None, 'reason': '模板未覆盖权限申请',
+                    'maintainer': '建议新增权限申请模板', 'alignments': [], 'fields': [], 'conflicts': []}):
                 self.assertEqual(self.process()['comment_action'], 'updated')
-            self.assertIn('提交内容规范性检查：通过', self.comments[1]['body'])
+            self.assertIn('提交内容检查：通过', self.comments[1]['body'])
             self.assertNotIn('建议新增权限申请模板', self.comments[1]['body'])
             self.assertEqual(self.rows('maintainer_suggestions')[0]['suggestion'], '建议新增权限申请模板')
             self.assertEqual([w[0] for w in self.writes], ['POST', 'PATCH', 'PATCH'])

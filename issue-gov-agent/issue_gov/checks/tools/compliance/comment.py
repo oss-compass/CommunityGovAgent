@@ -174,3 +174,52 @@ def format_compliance_check(result: dict[str, Any], *,
             return render_comment_template("insufficient_info", reason=_escape_comment_text(recommendation["reason"]), templates="\n\n".join(template_blocks))
         raise ProcessingError("模板推荐未返回需要贡献者修改的有效结果")
     raise ProcessingError("规范性检查未返回需要贡献者修改的有效结果")
+
+
+def format_decision(decision: dict[str, Any], *, templates: list[dict] | tuple[dict, ...] = ()) -> str:
+    """按评估决定生成回复。只包含开发者需要处理的部分。
+
+    Args:
+        decision: decide_review 返回的决定，使用 comment_kind 和 comment_parts。
+        templates: 已解析模板，用于附上可复制内容。
+    Returns:
+        可发布的 Markdown。不需要回复时返回空字符串。
+    """
+    kind = decision.get("comment_kind")
+    parts = decision.get("comment_parts") or {}
+    if kind == "pass":
+        return render_comment_template("review_passed")
+    if kind == "template":
+        selected = next((item for item in templates if item["name"] == parts.get("template")), None)
+        block = "\n".join(_format_template(selected)) if selected is not None else ""
+        return render_comment_template(
+            "review_template", reason=_escape_comment_text(parts.get("reason") or ""),
+            name=_escape_comment_text(parts.get("template") or ""), template=block)
+    if kind == "insufficient":
+        blocks = ["\n".join(_format_template(item, show_name=True)) for item in templates]
+        return render_comment_template(
+            "review_insufficient", reason=_escape_comment_text(parts.get("reason") or ""),
+            templates="\n\n".join(blocks))
+    if kind == "conflict":
+        notes = "\n".join(f"- {_escape_comment_text(item['note'])}" for item in parts.get("conflicts") or [])
+        return f"### 提交内容检查：未通过\n\n#### 内容冲突\n{notes}"
+    if kind != "issues":
+        return ""
+    sections = ["### 提交内容检查：未通过", ""]
+    structural = parts.get("structure") or []
+    content = parts.get("content") or []
+    conflicts = parts.get("conflicts") or []
+    if structural:
+        lines = "\n".join(
+            f"- {_escape_comment_text(item['field'])}：{_escape_comment_text(item['message'])}"
+            for item in structural)
+        sections.extend(["#### 结构", lines, ""])
+    if content:
+        lines = "\n".join(
+            f"- {_escape_comment_text(item['field'])}：{_escape_comment_text(item['message'])}"
+            for item in content)
+        sections.extend(["#### 必填内容", lines, ""])
+    if conflicts:
+        lines = "\n".join(f"- {_escape_comment_text(item['note'])}" for item in conflicts)
+        sections.extend(["#### 内容冲突", lines, ""])
+    return "\n".join(sections).strip()
