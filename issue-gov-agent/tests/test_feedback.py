@@ -93,8 +93,8 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn("请补充具体诉求", comment)
         self.assertEqual(comment.count("<details>"), 3)
         self.assertEqual(comment.count("</details>"), 3)
-        self.assertIn("<summary>缺陷反馈：展开显示模板内容", comment)
-        self.assertIn("<summary>文档反馈：展开显示模板内容", comment)
+        self.assertIn("<summary>缺陷反馈：点击展开", comment)
+        self.assertIn("<summary>文档反馈：点击展开", comment)
         self.assertNotIn("<details open", comment)
         fences = [t.content for t in MarkdownIt("commonmark").parse(comment) if t.type == "fence"]
         self.assertEqual(len(fences), 4)
@@ -118,7 +118,7 @@ class FeedbackTests(unittest.TestCase):
         comment = compliance_comment.format_compliance_check({"status": "no_match", "recommendation": result},
                                           templates=[other, TEMPLATE])
         self.assertEqual(comment.count("<details>"), 1)
-        self.assertIn("<summary>展开显示模板内容，将模板内容复制到 Issue 中填写。</summary>", comment)
+        self.assertIn("<summary>点击展开</summary>", comment)
         self.assertIn("#### 模板推荐：缺陷反馈", comment)
         self.assertNotIn("查看仓库模板", comment)
         self.assertNotIn("模板完善建议", comment)

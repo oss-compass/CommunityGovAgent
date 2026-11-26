@@ -185,8 +185,9 @@ def check_issue(
                         _matches_dropdown_choice(option, allowed) for option in content_key.split(",")))
                 if not valid:
                     choice = text["invalid_option_many"] if attributes.get("multiple", False) else text["invalid_option_one"]
+                    options = text["option_joiner"].join(allowed)
                     problems.append({"field": label, "reason": "invalid_option",
-                                     "message": text["invalid_option"] + choice + text["option_joiner"].join(allowed)})
+                                     "message": choice.replace("{options}", options)})
         check = {"template": template["name"], "problems": problems}
         if markdown and not any(field.get("validations", {}).get("required", False) for field in fields):
             check["limitation"] = text["markdown_no_required"]

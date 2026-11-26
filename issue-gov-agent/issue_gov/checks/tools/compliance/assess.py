@@ -156,7 +156,7 @@ def _content_gaps(template: dict[str, Any], check: dict[str, Any], fields: list[
     for pending in pending_fields(template, check):
         found = by_label.get(pending["label"])
         if found is None or found["status"] != "answered":
-            ask = (found or {}).get("ask") or "请补充这项内容"
+            ask = (found or {}).get("ask") or "请补充具体内容"
             gaps.append({"field": pending["label"], "message": ask})
     return gaps
 
@@ -241,7 +241,7 @@ def decide_review(
     return _result(
         status="partial_match", recommendation_status=None, label_verdict="failed",
         comment_kind="issues",
-        comment_parts={"structure": structural, "content": gaps, "conflicts": conflicts},
+        comment_parts={"template": chosen, "structure": structural, "content": gaps, "conflicts": conflicts},
         maintainer=None, assessment=assessment)
 
 

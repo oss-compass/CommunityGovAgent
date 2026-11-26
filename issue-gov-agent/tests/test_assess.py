@@ -44,9 +44,10 @@ class DecideReviewTests(unittest.TestCase):
         self.assertEqual(decision["comment_kind"], "template")
         self.assertNotIn("conflicts", decision["assessment"])
         text = comment.format_decision(decision, templates=[TEMPLATE, other])
-        self.assertIn("#### 模板", text)
-        self.assertNotIn("内容冲突", text)
-        self.assertNotIn("必填内容", text)
+        self.assertIn("请改用 **功能需求**", text)
+        self.assertIn("这是功能需求", text)
+        self.assertNotIn("前后描述不一致", text)
+        self.assertNotIn("还需要补充", text)
 
     def test_synonym_and_unstructured_content_can_pass(self):
         decision = assess.decide_review(program("partial_match", [
@@ -71,7 +72,8 @@ class DecideReviewTests(unittest.TestCase):
         }, SEGMENTS)
         self.assertEqual(decision["label_verdict"], "failed")
         text = comment.format_decision(decision, templates=[TEMPLATE])
-        self.assertIn("#### 必填内容", text)
+        self.assertIn("当前使用的是 **缺陷反馈**，还有一处需要调整。", text)
+        self.assertIn("#### 还需要补充", text)
         self.assertIn("请写明期望行为", text)
         self.assertNotIn("缺少此必填章节", text)
 
@@ -83,8 +85,8 @@ class DecideReviewTests(unittest.TestCase):
             "fields": [], "conflicts": [],
         }, SEGMENTS)
         text = comment.format_decision(decision, templates=[TEMPLATE])
-        self.assertIn("#### 结构", text)
-        self.assertIn("影响版本", text)
+        self.assertIn("#### 选项和必选项", text)
+        self.assertIn("**影响版本**", text)
         self.assertEqual(decision["label_verdict"], "failed")
 
     def test_conflict_fails_after_template_is_accepted(self):
@@ -94,7 +96,7 @@ class DecideReviewTests(unittest.TestCase):
                 "kind": "version_env", "left": "S1", "right": "S2", "note": "环境与日志中的版本不一致"}],
         }, SEGMENTS)
         self.assertEqual(decision["status"], "partial_match")
-        self.assertIn("内容冲突", comment.format_decision(decision, templates=[TEMPLATE]))
+        self.assertIn("前后描述不一致", comment.format_decision(decision, templates=[TEMPLATE]))
 
     def test_invalid_evidence_cannot_mark_a_field_answered(self):
         for status in ("answered", "partial"):
@@ -147,7 +149,8 @@ class DecideReviewTests(unittest.TestCase):
         self.assertEqual(reviewed["conflicts"][0]["kind"], "step_result")
         text = comment.format_decision(
             {"comment_kind": "conflict", "comment_parts": {"conflicts": reviewed["conflicts"]}})
-        self.assertIn("#### 内容冲突", text)
+        self.assertIn("有一处描述对不上", text)
+        self.assertIn("步骤和现象不是同一件事", text)
         self.assertNotIn("模板", text)
 
     def test_missing_conflict_list_does_not_count_as_no_conflict(self):

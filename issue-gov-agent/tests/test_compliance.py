@@ -1203,7 +1203,10 @@ class RequiredAndDropdownTests(unittest.TestCase):
                         result = compliance_check.check_issue('[Test] 问题', '### 平台\n' + content, [template])
                         self.assertEqual(result['status'], 'pass' if valid else 'partial_match')
                         if not valid:
-                            self.assertEqual(result['checks'][0]['problems'][0]['reason'], 'invalid_option')
+                            problem = result['checks'][0]['problems'][0]
+                            self.assertEqual(problem['reason'], 'invalid_option')
+                            expect = "请从 Linux、Windows、Other, custom、No response 中选择。" if multiple else "请从 Linux、Windows、Other, custom、No response 中选择一项。"
+                            self.assertEqual(problem['message'], expect)
                 for body in ('', '### 平台\n', '### 平台\n_No response_'):
                     result = compliance_check.check_issue('[Test] 问题', body, [template])
                     self.assertEqual(result['status'], 'partial_match' if required else 'pass')

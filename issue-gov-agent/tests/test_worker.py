@@ -192,7 +192,7 @@ class WorkerTests(unittest.TestCase):
                     self.assertIn(message, comment)
                 if status == "no_match":
                     self.assertEqual(result["recommendation_status"], "recommended")
-                    self.assertIn("#### 模板", comment)
+                    self.assertIn("请改用", comment)
                     self.assertIn("提交内容检查：未通过", comment)
                 else:
                     model.assert_not_called()
@@ -304,7 +304,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["recommendation_status"], "recommended")
         comment = next(c.args[2]["body"] for c in api.call_args_list
                        if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
-        self.assertIn("#### 模板", comment)
+        self.assertIn("请改用 **缺陷反馈**", comment)
         self.assertIn("**模板正文（Markdown）**", comment)
         self.assertNotIn("崩溃了", comment)
         self.assertNotIn("启动失败", comment)
@@ -538,8 +538,7 @@ class WorkerTests(unittest.TestCase):
                     self.assertIsNone(row["last_error"])
                     self.assertEqual(json.loads(row["result"])["recommendation_status"], "recommended")
                     publish.assert_called_once()
-                    self.assertIn("#### 模板", publish.call_args.args[2])
-                    self.assertIn("请改用 缺陷反馈", publish.call_args.args[2])
+                    self.assertIn("请改用 **缺陷反馈**", publish.call_args.args[2])
                     self.assertNotIn("模板推荐未完成", publish.call_args.args[2])
 
     def test_shared_client_reuses_templates_across_queued_events(self):

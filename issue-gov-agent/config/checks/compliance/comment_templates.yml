@@ -7,23 +7,39 @@ passed: |-
 review_passed: |-
   ### 提交内容检查：通过
 
+  当前内容已经符合要求，可以继续处理。
+
 review_template: |-
   ### 提交内容检查：未通过
 
-  #### 模板
   {reason}
 
-  请改用 {name}。
+  请改用 **{name}**，展开下面的内容复制到 Issue 中填写。
 
   {template}
 
 review_insufficient: |-
   ### 提交内容检查：未通过
 
-  #### 模板
   {reason}
 
+  请补充具体诉求后，从下面选择一份模板填写。
+
   {templates}
+
+review_conflict: |-
+  ### 提交内容检查：未通过
+
+  {lead}
+
+  {notes}
+
+review_issues: |-
+  ### 提交内容检查：未通过
+
+  {intro}
+
+  {sections}
 
 # 部分匹配
 partial_match: |-
@@ -67,7 +83,7 @@ insufficient_info: |-
 # 共用折叠块；列出多个候选时 name 填入“模板名：”，其余情况留空。
 template: |-
   <details>
-  <summary>{name}展开显示模板内容，将模板内容复制到 Issue 中填写。</summary>
+  <summary>{name}点击展开</summary>
 
   {content}
 

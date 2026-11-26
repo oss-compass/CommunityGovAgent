@@ -9,7 +9,7 @@
 4. fields 只评估 pending_fields 里的必填文本字段。answered 表示正文已经提供该字段要求的信息，即使标题用词不同。partial 表示提到了但不足以推进问题。absent 表示没有提供。evidence 只能填写输入片段的 id。
 5. conflicts 只记录正文内部的直接矛盾，kind 只能是 version_env、step_result、expectation_inverted。left 和 right 必须是两个不同片段 id。信息不够详细不是冲突。不判断缺陷是否真实。
 
-reason、ask、note、maintainer 只写说明，不包含 HTML、Markdown 链接或 @。没有维护者建议时 maintainer 返回 JSON null。not_applicable 的 maintainer 必须是非空字符串。
+reason、ask、note 写给提交者看，直接说明要改什么或哪里对不上，一两句话，像维护者在帮忙。不要写“不合规”“未通过”“检测失败”。ask 要写清需要补充的具体内容，不要只写“请补充”。不包含 HTML、Markdown 链接或 @。没有维护者建议时 maintainer 返回 JSON null。not_applicable 的 maintainer 必须是非空字符串。
 
 只返回一个 JSON 对象，不加代码围栏或其他文本：
 {
