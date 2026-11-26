@@ -177,7 +177,7 @@ another-org/demo: []
 - **修复问题后重新处理失败任务**：执行 `retry-failed`；若后台尚未运行，先执行 `start`。任务会重新排队，由后台处理。
 - **机器重启后恢复服务**：执行 `start`，后台会恢复已入库的 Webhook 任务。如果机器会在注销时清理用户进程，需要使用该机器允许的常驻任务方式。
 
-容器部署（接收服务、可扩容消费者、PostgreSQL 和 RabbitMQ）见 [DEPLOY.md](DEPLOY.md)。`manage.py` 启动方式不变。
+容器部署（接收服务、可扩容消费者、PostgreSQL 和 RabbitMQ）见 [docs/deploy.md](../docs/deploy.md)。`manage.py` 启动方式不变。
 
 ## 工作流程
 

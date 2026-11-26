@@ -1,6 +1,6 @@
 # 容器部署
 
-本机两套服务并存时的边界、灰度入口和接手步骤见 [HANDOFF.md](HANDOFF.md)。
+本机两套服务并存时的边界、灰度入口和接手步骤见 [handoff.md](handoff.md)。
 
 接收服务、分析消费者、PostgreSQL 和 RabbitMQ 由仓库根目录的 `docker-compose.yml` 一起启动。检查规则、评论内容和模型推荐与原来的单机进程相同；变化的是任务如何传递和保存。
 

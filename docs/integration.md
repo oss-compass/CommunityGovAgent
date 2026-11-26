@@ -1,0 +1,203 @@
+# Issue 治理服务
+
+本文是给其他 agent 接入和部署本服务的单独说明，不依赖仓库里的其他文档。
+
+本服务没有任务查询接口。接入方只向 Webhook 投递 Issue 事件。处理结果写在 PostgreSQL 的 `events.result`，不在 HTTP 响应里。
+
+## 服务介绍
+
+服务接收 AtomGit / GitCode 的 Issue Webhook，检查标题和正文是否符合仓库 Issue 模板，必要时调用模型推荐模板，然后在 Issue 上发表或更新一条评论，并按结论写入检查标签。
+
+它不判断问题是否真实、分类是否正确或信息是否充分。同一 Issue 同时只有一条活跃任务。新通知会把尚未完成的旧任务标为 `superseded`。
+
+```text
+GitCode Issue 事件
+    │  POST /webhook，请求头 X-GitCode-Token
+    ▼
+接收服务 receiver
+    │  校验密码、筛选事件、写入 PostgreSQL、投递消息
+    ▼
+RabbitMQ  issue.analysis
+    │
+消费者 consumer × N
+    │  读取 Issue 和模板、检查、必要时调用模型
+    │  发表或更新一条评论，并写入检查标签
+    ▼
+PostgreSQL  events / reports
+```
+
+处理结果：
+
+| 情况 | 检查状态 | 评论 | 标签 |
+| --- | --- | --- | --- |
+| 完整匹配 | `pass` | 此前没有评论则不发；已有评论则更新为通过 | `issue-check-passed` |
+| 部分匹配 | `partial_match` | 指出缺项，并给出可复制模板 | `issue-check-failed` |
+| 未匹配且推荐出模板 | `no_match` | 给出推荐理由和该模板 | `issue-check-failed` |
+| 未匹配且信息不足 | `no_match` | 列出全部模板，要求补充信息 | `issue-check-failed` |
+| 未匹配且现有模板不适用 | `no_match`，`recommendation_status=not_applicable` | 不发评论；建议写入维护者建议表 | `issue-check-passed` |
+| 模板缺失或无法解析 | `template_error` | 不发评论；建议写入维护者建议表 | 不改标签 |
+| 内容与上次检查相同 | `skipped_unchanged` | 不重复处理 | 不改标签 |
+| Issue 已关闭 | `skipped_closed` | 不处理 | 不改标签 |
+
+相邻两次修改间隔不超过 3 分钟且已有本服务评论时，更新原评论。仓库没有模板时，回退读取所属组织 `.gitcode` 仓库默认分支中的公共模板。
+
+标签名固定为 `issue-check-passed` 和 `issue-check-failed`。服务不会创建它们，仓库里需要事先存在。写入失败只记在该任务上，任务仍完成，其他任务不受影响。新标签写成功后才移除相反标签。`label_action=rejected` 之后，如果标题和正文不再变化，后续通知会变成 `skipped_unchanged`，不会自动重试打标签。
+
+一次检查完成后，`events.result` 是 JSON：
+
+| 字段 | 取值 |
+| --- | --- |
+| `status` | 上表中的检查状态 |
+| `comment_action` | `created` 已发新评论，`updated` 已更新评论，`recovered` 已找到先前评论，`suppressed` 未发评论，`unchanged` 内容未变，`skipped_closed` 已关闭 |
+| `recommendation_status` | 模型推荐状态；未调用模型时可能为空 |
+| `label` | `issue-check-passed` 或 `issue-check-failed`；未分配时没有该字段 |
+| `label_action` | `assigned` 已写入，`rejected` 平台拒绝，`skipped` 本次未分配 |
+| `maintainer_suggestion_id` | 写入维护者建议时的记录编号 |
+
+任务状态还有 `queued`、`dispatching`、`running`、`failed`。可重试错误最多 5 次。模型密钥全部失败时任务变为 `failed`，并进入死信队列 `issue.analysis.dlq`。失败原因在 `events.last_error`。
+
+## 部署说明
+
+编排文件是仓库根目录的 `docker-compose.yml`，项目名 `issue-gov`。其中有 PostgreSQL、RabbitMQ、接收服务 `receiver`、消费者 `consumer`。
+
+全项目只有一份环境文件：`issue-gov-agent/.env`。不要在仓库根目录另放 `.env`，也不要把 `DATABASE_URL`、`RABBITMQ_URL` 写进这个文件。程序用 `POSTGRES_*` 和 `RABBITMQ_*` 拼连接串。容器内主机名是 `postgres` 和 `rabbitmq`，端口是 `5432` 和 `5672`。
+
+接入仓库写在 `issue-gov-agent/repository.yml`：
+
+```yaml
+owner/repo:
+  - maintainer-username
+owner/another-repo: []
+```
+
+未列出的仓库会被忽略。名单下的账号只用于维护者建议。修改 `.env` 或 `repository.yml` 后执行 `docker compose up -d`，接收服务和消费者才会重新读取。
+
+`.env` 至少要有：
+
+| 变量 | 作用 |
+| --- | --- |
+| `WEBHOOK_SECRET` | Webhook 密码，对应请求头 `X-GitCode-Token` |
+| `ATOMGIT_TOKEN` | 读取 Issue、模板和发表评论的服务账号令牌 |
+| `AGENT_API_KEY` 或 `AGENT_API_KEYS` | 模型密钥。多个密钥用英文逗号分隔 |
+| `LLM_BASE_URL` | 模型服务地址 |
+| `LLM_MODEL` | 模型名 |
+| `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB` | 数据库账号。口令只用字母和数字 |
+| `POSTGRES_PORT` | 宿主机回环端口，默认 `54329` |
+| `RABBITMQ_USER`、`RABBITMQ_PASSWORD` | 队列账号 |
+| `RABBITMQ_PORT`、`RABBITMQ_MANAGEMENT_PORT` | 队列和管理页的宿主机回环端口，默认 `56729` 和 `15672` |
+| `WEB_CONCURRENCY` | 一个接收容器里的 Gunicorn 工作进程数，默认 `2`，范围 1 到 32 |
+
+首次生成配置：
+
+```bash
+cd issue-gov-agent
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python manage.py init
+```
+
+然后填写令牌、模型配置和 `repository.yml`。在仓库根目录启动：
+
+```bash
+export CONTAINER_UID="$(id -u)" CONTAINER_GID="$(id -g)"
+docker compose --env-file issue-gov-agent/.env up -d --build
+```
+
+不导出 `CONTAINER_UID` 和 `CONTAINER_GID` 时，容器用户是 `1000:1000`，读不了属主为其他人的 `0600` 配置。消费者数量写在 `docker-compose.yml` 的 `consumer.deploy.replicas`。改数字后再次执行 `docker compose up -d`。
+
+消费者镜像要下载 Node.js 22 和 Claude Code。接收镜像不包含它们。数据库和队列端口只绑在 `127.0.0.1`。RabbitMQ 管理页是 `http://127.0.0.1:15672`。
+
+就绪检查：
+
+```bash
+curl -sS http://127.0.0.1:7100/ready
+```
+
+新机器若按编排文件的默认端口发布接收服务，则把 `7100` 换成实际映射端口。返回 `{"status":"ok"}` 表示数据库和队列都可连接。
+
+失败任务修好密钥或网络后，在消费者容器中执行：
+
+```bash
+docker compose exec -T consumer python -m issue_gov.worker --retry-failed
+```
+
+它把失败任务放回分析队列，并清掉对应的死信消息。
+
+数据保存：
+
+| 组件 | 作用 |
+| --- | --- |
+| PostgreSQL | 任务 `events`、报告 `reports`、已检查内容 `issue_checks`、待确认评论 `pending_comments`、维护者建议 `maintainer_suggestions`、接口冷却 `api_cooldown` |
+| RabbitMQ | 待分析队列 `issue.analysis`，死信队列 `issue.analysis.dlq` |
+| Elasticsearch | 本服务不使用 |
+
+`manage.py` 不设置 `SERVICE_MODE`，只适合本机 SQLite，不会连接 Compose 里的 PostgreSQL 和 RabbitMQ。
+
+### 当前灰度机器
+
+配置目录是 `/opt/CommunityGovAgent/`，里面有 `.env`、`repository.yml` 和 `docker-compose.yml`。镜像从 `/root/CommunityGovAgent` 构建。在该目录执行 `docker compose build` 和 `docker compose up -d`。
+
+接收服务只监听 `127.0.0.1:7100`，容器内仍是 `7000`。公网地址是 `https://governance-agent.oss-compass.io/api/v1/issue/webhook`，由 Nginx 转到 `http://127.0.0.1:7100/webhook`。公网 `/health` 不是这个接收服务。
+
+`0.0.0.0:7000` 是旧服务。不要停止、重启或重新部署它，也不要让 Compose 占用 7000。已经指向 `http://113.44.237.121:7000/webhook` 的生产 Webhook 保持不动。灰度使用上面的 HTTPS 地址，并另建一条 Webhook。
+
+灰度数据库是 `127.0.0.1:54329` 上的库 `issue_gov`。不要对正在服务的 RabbitMQ 跑并发测试脚本，它会使用同一个分析队列并删除 `events`。
+
+## 接口说明
+
+接收服务只有三个 HTTP 接口。容器内监听 `7000`。灰度宿主机是 `127.0.0.1:7100`。
+
+### 在 GitCode 上登记
+
+进入仓库的 **项目设置 → WebHook → 新建 WebHook**：
+
+| 项目 | 填写内容 |
+| --- | --- |
+| URL | 灰度用 `https://governance-agent.oss-compass.io/api/v1/issue/webhook`。其他部署用 `http://服务器:<接收端口>/webhook` |
+| 认证方式 | **WebHook 密码**。不要选「签名密钥」 |
+| 密码 | `.env` 中的 `WEBHOOK_SECRET` |
+| POST 内容类型 | `application/json` |
+| 事件类型 | 只勾选「Issue 事件」 |
+| 启用状态 | 勾选「激活」 |
+
+服务账号需要能读取该仓库的 Issue 和模板，并能发表评论。仓库路径还要写进 `repository.yml`。
+
+### `GET /health`
+
+进程存活。返回 `200` 和 `{"status":"ok"}`。不检查数据库和队列。
+
+### `GET /ready`
+
+数据库可读写，且队列模式下还能连接 RabbitMQ 时，返回 `200` 和 `{"status":"ok"}`。初始化未完成返回 `503` 和 `{"status":"initializing"}`。依赖不可用返回 `503` 和 `{"status":"unavailable"}`。
+
+### `POST /webhook`
+
+请求头 `X-GitCode-Token` 的值等于 `WEBHOOK_SECRET`。`Content-Type` 为 `application/json`。请求体上限 1 MiB。
+
+会入队的事件同时满足：
+
+- `object_kind` 或 `event_type` 为 `issue`
+- `project.path_with_namespace` 在 `repository.yml` 中
+- `object_attributes.action` 为 `open` 或 `update`
+- Issue 未关闭
+- `update` 时标题、描述或正文确有变化
+- `object_attributes.iid` 是正整数
+
+GitCode 的测试推送通常不是这种事件。密码正确时返回忽略，不创建任务。
+
+响应：
+
+| HTTP | 正文 | 含义 |
+| --- | --- | --- |
+| 202 | `{"status":"queued","state":"queued"}` | 新任务已入队。队列模式下数据库先写成 `dispatching`，响应里的 `state` 仍是 `queued` |
+| 200 | `{"status":"duplicate","state":"<已有状态>"}` | 同一事件重复投递，不新建任务 |
+| 200 | `{"status":"ignored"}` | 密码正确，但不是要处理的 Issue 事件 |
+| 401 | `{"error":"unauthorized"}` | 密码错误 |
+| 400 | `{"error":"expected JSON object"}` | 正文不是 JSON 对象 |
+| 400 | `{"error":"invalid Issue event"}` | 目标仓库的 Issue 事件缺少字段或编号不合法 |
+| 400 | `{"error":"invalid event identifier"}` | 事件标识不是字符串 |
+| 503 | `{"error":"initializing"}` | 数据库尚未就绪，通知方应稍后重试 |
+| 503 | `{"error":"queue unavailable"}` | 入库或投递队列失败，通知方应稍后重试 |
+| 413 | Flask 默认响应 | 请求体超过 1 MiB |
+
+Webhook 响应不包含检查结论。结论在 `events.result`，失败原因在 `events.last_error`。
