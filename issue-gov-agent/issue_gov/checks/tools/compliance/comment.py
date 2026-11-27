@@ -176,6 +176,26 @@ def format_compliance_check(result: dict[str, Any], *,
     raise ProcessingError("规范性检查未返回需要贡献者修改的有效结果")
 
 
+def _review_sections(content: list[dict[str, str]], conflicts: list[dict[str, str]],
+                     structural: list[dict[str, str]] | None = None) -> str:
+    """把缺项、冲突和封闭结构问题收成评论小节。没有内容时返回空字符串。"""
+    blocks = []
+    if structural:
+        lines = "\n".join(
+            f"- **{_escape_comment_text(item['field'])}**：{_escape_comment_text(item['message'])}"
+            for item in structural)
+        blocks.append(f"#### 选项\n\n{lines}")
+    if content:
+        lines = "\n".join(
+            f"- **{_escape_comment_text(item['field'])}**：{_escape_comment_text(item['message'])}"
+            for item in content)
+        blocks.append(f"#### 待补充内容\n\n{lines}")
+    if conflicts:
+        lines = "\n".join(f"- {_escape_comment_text(item['note'])}" for item in conflicts)
+        blocks.append(f"#### 前后描述不一致\n\n{lines}")
+    return "\n\n".join(blocks)
+
+
 def format_decision(decision: dict[str, Any], *, templates: list[dict] | tuple[dict, ...] = ()) -> str:
     """按评估决定生成回复。只包含开发者需要处理的部分。
 
@@ -192,41 +212,33 @@ def format_decision(decision: dict[str, Any], *, templates: list[dict] | tuple[d
     if kind == "template":
         selected = next((item for item in templates if item["name"] == parts.get("template")), None)
         block = "\n".join(_format_template(selected)) if selected is not None else ""
-        reason = _escape_comment_text(parts.get("reason") or "") or "当前内容更适合另一份模板。"
-        return render_comment_template(
+        reason = _escape_comment_text(parts.get("reason") or "") or "当前内容更适合使用其他模板。"
+        text = render_comment_template(
             "review_template", reason=reason,
             name=_escape_comment_text(parts.get("template") or ""), template=block)
+        extra = _review_sections(parts.get("content") or [], parts.get("conflicts") or [])
+        return text if not extra else f"{text}\n\n{extra}"
     if kind == "insufficient":
         blocks = ["\n".join(_format_template(item, show_name=True)) for item in templates]
-        reason = _escape_comment_text(parts.get("reason") or "") or "现有信息还不足以判断诉求属于哪一类。"
+        reason = _escape_comment_text(parts.get("reason") or "") or "现有信息不足以判断应使用哪一份模板。"
         return render_comment_template(
             "review_insufficient", reason=reason, templates="\n\n".join(blocks))
+    if kind == "unmatched":
+        blocks = ["\n".join(_format_template(item, show_name=True)) for item in templates]
+        return render_comment_template("review_unmatched", templates="\n\n".join(blocks))
     if kind == "conflict":
         conflicts = parts.get("conflicts") or []
         notes = "\n".join(f"- {_escape_comment_text(item['note'])}" for item in conflicts)
-        lead = "正文里有一处描述对不上，请核对后修改：" if len(conflicts) == 1 else "正文里有几处描述对不上，请核对后修改："
+        lead = "正文里有一处描述不一致，请核对后修改：" if len(conflicts) == 1 else "正文里有几处描述不一致，请核对后修改："
         return render_comment_template("review_conflict", lead=lead, notes=notes)
     if kind != "issues":
         return ""
     structural = parts.get("structure") or []
     content = parts.get("content") or []
     conflicts = parts.get("conflicts") or []
-    blocks = []
-    if structural:
-        lines = "\n".join(
-            f"- **{_escape_comment_text(item['field'])}**：{_escape_comment_text(item['message'])}"
-            for item in structural)
-        blocks.append(f"#### 选项和必选项\n\n{lines}")
-    if content:
-        lines = "\n".join(
-            f"- **{_escape_comment_text(item['field'])}**：{_escape_comment_text(item['message'])}"
-            for item in content)
-        blocks.append(f"#### 还需要补充\n\n{lines}")
-    if conflicts:
-        lines = "\n".join(f"- {_escape_comment_text(item['note'])}" for item in conflicts)
-        blocks.append(f"#### 前后描述不一致\n\n{lines}")
+    sections = _review_sections(content, conflicts, structural)
     name = _escape_comment_text(parts.get("template") or "")
     total = len(structural) + len(content) + len(conflicts)
-    spot = "还有一处需要调整。" if total == 1 else "下面几处还需要调整。"
-    intro = f"当前使用的是 **{name}**，{spot}" if name else spot
-    return render_comment_template("review_issues", intro=intro, sections="\n\n".join(blocks))
+    spot = "此处需要修改。" if total == 1 else "以下几处需要修改。"
+    intro = f"当前使用模板为 **{name}**，{spot}" if name else spot
+    return render_comment_template("review_issues", intro=intro, sections=sections)

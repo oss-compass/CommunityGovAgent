@@ -25,13 +25,12 @@ from issue_gov.settings import Config
 
 LOG = logging.getLogger("issue-gov-webhook")
 MAX_ATTEMPTS = 5  # 每个事件最多完成 5 次处理尝试；进程中断不消耗次数
-COMMENT_EDIT_SECONDS = 3 * 60
 CHECK_PASSED_LABEL = "issue-check-passed"
 CHECK_FAILED_LABEL = "issue-check-failed"
 
 
 def _issue_edit_time(issue: dict) -> float | None:
-    """使用平台的 Issue 修改时间，避免处理耗时改变三分钟评论更新窗口。
+    """读取 Issue 的修改时间，写入检查记录。
 
     Args:
         issue: 平台返回的 Issue 对象，updated_at 应为带时区的 ISO 日期时间。
@@ -42,7 +41,7 @@ def _issue_edit_time(issue: dict) -> float | None:
         value = datetime.fromisoformat(issue.get("updated_at"))
         return value.timestamp() if value.tzinfo is not None else None
     except (ValueError, TypeError, OverflowError):
-        return None  # 缺少可靠时间时不合并评论。
+        return None
 
 
 def issue_content_hash(issue: dict) -> str:
@@ -233,24 +232,18 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
             published = False
         body = analysis_result["comment"] + "\n\n" + marker
 
-    if not resume and publish_comment and not published and edit_time is not None:
-        # 未完成的上一版可能已写入平台，先找它，再找最近完成检查的评论。
-        candidates = []
+    if not resume and publish_comment and not published:
+        # 上一条评估评论仍是最后一条时原地修改；其后已有其他评论则另发一条。
+        markers = []
         if pending is not None:
-            candidates.append((pending["marker"], delivery.get("issue_updated_at")))
+            markers.append(pending["marker"])
         if checked is not None:
-            previous_time = (delivery.get("issue_updated_at") if delivery.get("comment_id") is not None
-                             else checked["issue_updated_at"])
-            candidates.append((checked["comment_marker"], previous_time))
-        for previous_marker, previous_time in candidates:
-            if (previous_marker and previous_time is not None
-                    and 0 <= edit_time - previous_time <= COMMENT_EDIT_SECONDS):
-                comment = client.find_comment(repository, number, previous_marker)
-                if comment is not None:
-                    comment_id = comment.get("id")
-                    if type(comment_id) is not int or comment_id <= 0:
-                        raise IssueProcessingError("评论 ID 格式不正确")
-                    break
+            markers.append(checked["comment_marker"])
+        comment = client.revisable_comment(repository, number, markers) if markers else None
+        if comment is not None:
+            comment_id = comment.get("id")
+            if type(comment_id) is not int or comment_id <= 0:
+                raise IssueProcessingError("评论 ID 格式不正确")
 
     # 写库或发布前复查，避免对已关闭或已变化的 Issue 保存过时结果。
     latest = client.request("GET", path)

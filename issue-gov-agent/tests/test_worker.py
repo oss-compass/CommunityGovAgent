@@ -304,7 +304,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["recommendation_status"], "recommended")
         comment = next(c.args[2]["body"] for c in api.call_args_list
                        if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
-        self.assertIn("请改用 **缺陷反馈**", comment)
+        self.assertIn("请改用模板 **缺陷反馈**", comment)
         self.assertIn("**模板正文（Markdown）**", comment)
         self.assertNotIn("崩溃了", comment)
         self.assertNotIn("启动失败", comment)
@@ -375,22 +375,19 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))["status"], "partial_match")
         model.assert_not_called()
 
-    def test_missing_model_key_retries_without_comment(self):
-        """验证模型密钥缺失时抛出可重试错误，不发布评论。
-
-        Args:
-            无。
-        Returns:
-            None；通过断言验证上述行为，结果不符时测试失败。
-        """
+    def test_missing_model_key_explains_the_unmatched_template(self):
+        """模型未配置且认不出模板时，评论说明原因并列出模板，标签为未通过。"""
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
         with patch.object(atomgit.AtomGit, "request", side_effect=self.replay(self.responses(issue))) as api:
             result = worker._process_issue(replace(self.config, agent_api_key=""), "example/repo", 12,
                                            client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(result["status"], "no_match")
-        self.assertEqual(result["label_verdict"], "unchanged")
-        self.assertEqual(result["comment_action"], "suppressed")
-        self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
+        self.assertEqual(result["label_verdict"], "failed")
+        self.assertEqual(result["comment_action"], "created")
+        comment = next(c.args[2]["body"] for c in api.call_args_list
+                       if c.args[0] == "POST" and str(c.args[1]).endswith("/comments"))
+        self.assertIn("请使用以下模板提交内容", comment)
+        self.assertIn("缺陷反馈", comment)
 
     def test_edit_during_analysis_retries_without_stale_comment(self):
         """验证分析期间 Issue 内容被修改时抛出可重试错误，不发布过时评论。
@@ -438,13 +435,28 @@ class WorkerTests(unittest.TestCase):
             worker._process_issue(self.config, "outside/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         api.assert_not_called()
 
-    def test_issue_edits_create_new_comments_but_duplicate_events_do_not(self):
-        """正文修改后即使检查结果相同也新增评论，重复投递同一事件仍去重。"""
+    def test_issue_edits_update_the_open_comment_and_duplicate_events_do_not(self):
+        """正文再次修改且没有后续评论时更新原评论，重复投递同一事件仍去重。"""
         app = receiver.create_app(self.config)
         client = atomgit.AtomGit(self.config.token, request_interval=0)
         issue = {**ISSUE, "body": "缺少章节"}
         edited = {**issue, "body": issue["body"] + "\n\n."}
-        with patch.object(client, "request", side_effect=self.replay([*self.responses(issue), edited, edited, {}])) as api:
+        posted = []
+        base = self.replay([*self.responses(issue), edited, edited])
+
+        def respond(method, path, data=None):
+            if method == "GET" and "/comments?" in path:
+                return [{"id": index + 1, "body": item["body"], "created_at": "2026-11-17T00:00:00Z"}
+                        for index, item in enumerate(posted)]
+            if method == "PATCH" and "/comments/" in path:
+                posted[int(path.rsplit("/", 1)[-1]) - 1]["body"] = data["body"]
+                return {}
+            result = base(method, path, data)
+            if method == "POST" and str(path).endswith("/comments"):
+                posted.append({"body": data["body"]})
+            return result
+
+        with patch.object(client, "request", side_effect=respond) as api:
             with app.test_client() as receiver_client:
                 for index in range(2):
                     payload = {"object_kind": "issue", "uuid": f"edit-{index}",
@@ -458,13 +470,12 @@ class WorkerTests(unittest.TestCase):
                     self.assertTrue(worker.process_one(self.config, client=client))
                     self.assertFalse(worker.process_one(self.config, client=client))
         posts = [c for c in api.call_args_list if c.args[0] == "POST" and c.args[1].endswith("/comments")]
-        self.assertEqual(len(posts), 2)
+        patches = [c for c in api.call_args_list if c.args[0] == "PATCH" and "/comments/" in c.args[1]]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(patches), 1)
         self.assertEqual(posts[0].args[2]["body"].split("\n\n<!-- issue-gov:")[0],
-                         posts[1].args[2]["body"].split("\n\n<!-- issue-gov:")[0])
-        self.assertNotEqual(posts[0].args[2], posts[1].args[2])
-        self.assertFalse(any(c.args[0] == "PATCH" or c.args[1] == "/user" or
-                             (c.args[0] == "GET" and "/comments" in c.args[1])
-                             for c in api.call_args_list))
+                         patches[0].args[2]["body"].split("\n\n<!-- issue-gov:")[0])
+        self.assertNotEqual(posts[0].args[2]["body"], patches[0].args[2]["body"])
 
     def test_model_failures_requeue_and_only_publish_after_success(self):
         """模型异常通过真实分析流程重新入队，恢复成功后仅发布一次评论。
@@ -513,8 +524,11 @@ class WorkerTests(unittest.TestCase):
                         self.assertTrue(worker.process_one(config, now=100, client=client))
                         row = receiver.queue_snapshot(config)["recent"][0]
                         self.assertEqual(row["state"], "completed")
-                        self.assertEqual(json.loads(row["result"])["comment_action"], "suppressed")
-                        publish.assert_not_called()
+                        result = json.loads(row["result"])
+                        self.assertEqual(result["comment_action"], "created")
+                        self.assertEqual(result["label_verdict"], "failed")
+                        publish.assert_called_once()
+                        self.assertIn("请使用以下模板提交内容", publish.call_args.args[2])
                         popen.assert_not_called()
                         continue
                     with self.assertLogs(worker.LOG, level="WARNING") as logs:
@@ -538,7 +552,7 @@ class WorkerTests(unittest.TestCase):
                     self.assertIsNone(row["last_error"])
                     self.assertEqual(json.loads(row["result"])["recommendation_status"], "recommended")
                     publish.assert_called_once()
-                    self.assertIn("请改用 **缺陷反馈**", publish.call_args.args[2])
+                    self.assertIn("请改用模板 **缺陷反馈**", publish.call_args.args[2])
                     self.assertNotIn("模板推荐未完成", publish.call_args.args[2])
 
     def test_shared_client_reuses_templates_across_queued_events(self):

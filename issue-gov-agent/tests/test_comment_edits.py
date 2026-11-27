@@ -1,4 +1,4 @@
-"""三分钟窗口、首次静默及修改后通过通知的事务恢复测试；不访问网络。"""
+"""评论原地更新、首次静默及修改后通过通知的事务恢复测试；不访问网络。"""
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -86,7 +86,10 @@ class CommentEditTests(unittest.TestCase):
             comment_id = self.next_id
             self.next_id += 1
         if self.write_error is None or self.accept_before_error:
-            self.comments[comment_id] = {'id': comment_id, 'body': data['body']}
+            self.comments[comment_id] = {
+                'id': comment_id, 'body': data['body'],
+                'created_at': self.issue.get('updated_at') or '2026-11-17T00:00:00Z',
+            }
         if self.write_error:
             raise self.write_error
         return {'id': comment_id}
@@ -98,22 +101,19 @@ class CommentEditTests(unittest.TestCase):
         with receiver.connect(self.config) as db:
             return [dict(row) for row in db.execute(f'SELECT * FROM {table}')]
 
-    def test_rolling_window_includes_180_seconds_and_new_comment_after_181(self):
-        """验证相邻修改间隔为 180 秒时更新评论，超过窗口时新增评论。
-
-            Args:
-                无。
-            Returns:
-                None；断言不满足时测试失败。
-            """
+    def test_later_edits_update_the_service_comment_until_someone_else_replies(self):
+        """上一条评估评论之后没有其他评论时继续修改它；有人回复后另发一条。"""
         self.assertEqual(self.process()['comment_action'], 'created')
-        for second in (179, 359):
+        for second in (179, 540):
             self.edit(second)
             self.assertEqual(self.process()['comment_action'], 'updated')
-        self.edit(540)
+        self.assertEqual(len(self.comments), 1)
+        self.comments[8] = {'id': 8, 'body': '作者补充了日志', 'created_at': '2026-11-17T00:10:00Z'}
+        self.edit(700)
         self.assertEqual(self.process()['comment_action'], 'created')
         self.assertEqual([w[0] for w in self.writes], ['POST', 'PATCH', 'PATCH', 'POST'])
-        self.assertEqual(len(self.comments), 2)
+        self.assertIn('540 fail', self.comments[1]['body'])
+        self.assertEqual(self.comments[8]['body'], '作者补充了日志')
 
     def test_pass_and_template_gap_update_previous_comment(self):
         """验证两种通过结果在窗口内更新评论，维护者建议只入库。
@@ -191,10 +191,11 @@ class CommentEditTests(unittest.TestCase):
         self.assertIn('未找到可用的', self.rows('maintainer_suggestions')[0]['reason'])
         self.assertEqual(self.process()['comment_action'], 'unchanged')
         self.assertEqual(len(self.rows('maintainer_suggestions')), 1)
-        # 配置故障不能清除历史评论，也不能延长原评论的更新窗口。
+        # 配置故障不能清除历史评论。其后没有其他评论时，通过结果仍修改原来那一条。
         self.edit(200, 'pass')
-        self.assertEqual(self.process()['comment_action'], 'created')
-        self.assertEqual(len(self.comments), 2)
+        self.assertEqual(self.process()['comment_action'], 'updated')
+        self.assertEqual(len(self.comments), 1)
+        self.assertIn('200 pass', self.comments[1]['body'])
 
     def test_pass_without_previous_comment_remains_silent_then_failure_creates(self):
         for seconds, outcome in ((0, 'pass'), (100, 'gap')):
@@ -205,25 +206,17 @@ class CommentEditTests(unittest.TestCase):
         self.edit(200)
         self.assertEqual(self.process()['comment_action'], 'created')
 
-    def test_pass_outside_window_creates_notification(self):
-        """验证窗口外通过时新增通知，窗口内再次通过则更新该通知。
-
-            Args:
-                无。
-            Returns:
-                None；断言不满足时测试失败。
-            """
+    def test_pass_updates_the_previous_comment_when_nothing_follows_it(self):
+        """通过结果在没有后续评论时修改上一条，有后续评论时另发一条并保留原文。"""
         self.process()
-        original = deepcopy(self.comments[1])
         self.edit(181, 'pass')
-        self.assertEqual(self.process()['comment_action'], 'created')
-        self.assertEqual(self.comments[1], original)
-        self.assertIn('181 pass', self.comments[2]['body'])
-        self.edit(361, 'pass')
         self.assertEqual(self.process()['comment_action'], 'updated')
-        self.assertIn('361 pass', self.comments[2]['body'])
-        self.edit(542, 'pass')
+        self.assertIn('181 pass', self.comments[1]['body'])
+        self.comments[9] = {'id': 9, 'body': '维护者已看到', 'created_at': '2026-11-17T00:04:00Z'}
+        self.edit(361, 'pass')
         self.assertEqual(self.process()['comment_action'], 'created')
+        self.assertIn('181 pass', self.comments[1]['body'])
+        self.assertIn('361 pass', self.comments[2]['body'])
         self.assertEqual(len(self.comments), 3)
 
     def test_deleted_comment_falls_back_to_create(self):
@@ -435,16 +428,17 @@ class CommentEditTests(unittest.TestCase):
             self.process()
         self.assertEqual([w[0] for w in self.writes], ['POST', 'PATCH'])
 
-    def test_missing_invalid_or_backwards_timestamp_does_not_edit_history(self):
+    def test_missing_or_unusable_timestamp_still_updates_when_the_reply_is_last(self):
         self.process()
         for stamp in (None, 'invalid', '2026-11-17T00:00:00', '2026-11-16T00:00:00Z'):
             self.issue['body'] += '修改'
             self.issue['updated_at'] = stamp
-            self.assertEqual(self.process()['comment_action'], 'created')
-        self.assertTrue(all(w[0] == 'POST' for w in self.writes))
+            self.assertEqual(self.process()['comment_action'], 'updated')
+        self.assertEqual([w[0] for w in self.writes], ['POST', 'PATCH', 'PATCH', 'PATCH', 'PATCH'])
+        self.assertEqual(len(self.comments), 1)
 
     def test_unrelated_comments_are_not_updated(self):
-        self.comments[99] = {'id': 99, 'body': '贡献者的评论'}
+        self.comments[99] = {'id': 99, 'body': '贡献者的评论', 'created_at': '2026-11-16T00:00:00Z'}
         self.process()
         self.edit(100)
         self.process()

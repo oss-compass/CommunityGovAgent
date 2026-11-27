@@ -107,14 +107,16 @@ def _suggestion(problems: list[dict[str, str]], extra: dict[str, str] | None,
 
 def _legacy_result(program: dict[str, Any], templates: list[dict[str, Any]], problems: list[dict[str, str]],
                    maintainers: tuple[str, ...], previously_commented: bool) -> dict[str, Any]:
-    """模型不可用时沿用程序结论。未匹配模板时不发评论，也不改标签。"""
+    """模型不可用时沿用程序结论。没有可用模板时无法核对正文矛盾，标签记为通过。"""
     if program["status"] == "template_error":
-        summary = {"status": "template_error", "recommendation_status": None}
+        summary = {"status": "template_error", "recommendation_status": None, "label_verdict": "passed"}
         return {"summary": summary, "comment": "", "publish_comment": False,
                 "maintainer_suggestion": _suggestion(problems, None, maintainers)}
     if program["status"] == "no_match":
-        summary = {"status": "no_match", "recommendation_status": None, "label_verdict": "unchanged"}
-        return {"summary": summary, "comment": "", "publish_comment": False,
+        summary = {"status": "no_match", "recommendation_status": None, "label_verdict": "failed"}
+        comment = compliance_comment.format_decision(
+            {"comment_kind": "unmatched"}, templates=templates)
+        return {"summary": summary, "comment": comment, "publish_comment": True,
                 "maintainer_suggestion": _suggestion(problems, None, maintainers)}
     summary = {"status": program["status"], "recommendation_status": None}
     publish_comment = should_publish_comment(summary, previously_commented=previously_commented)

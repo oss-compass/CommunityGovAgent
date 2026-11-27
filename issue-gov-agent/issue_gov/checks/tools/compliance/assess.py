@@ -1,10 +1,10 @@
-"""模板使用、完整性与正文冲突的模型评估。程序核对模型输出后再决定结论。"""
+"""模板使用、完整性与正文冲突的模型评估。模型复核程序的文本结论，程序保留封闭规则。"""
 
 import json
 import re
 from typing import Any
 
-from issue_gov.checks.tools.compliance.parse import _fields
+from issue_gov.checks.tools.compliance.parse import _fields, _section_key
 from issue_gov.checks.tools.compliance.recommend import invoke_model
 from issue_gov.checks.tools.compliance.rules import ASSESS_PROMPT
 from issue_gov.checks.tools.compliance.segment import segment_body
@@ -29,14 +29,19 @@ def consult(payload: dict[str, Any], agent_api_key: str, model: str, base_url: s
         max_turns="1", purpose="内容评估")
 
 
+def _filled_templates(program: dict[str, Any]) -> list[str]:
+    """程序认为已经按模板写全的名称。没有问题、也没有无法检查的限制。"""
+    return [item["template"] for item in program.get("checks") or []
+            if item.get("template") and not item.get("problems") and not item.get("limitation")]
+
+
 def current_template(program: dict[str, Any]) -> str | None:
     """程序已经唯一认定的模板。多个候选或没有匹配时返回 None。"""
     matched = list(program.get("matched_templates") or [])
     if len(matched) == 1:
         return matched[0]
     if program.get("status") == "pass":
-        complete = [item["template"] for item in program.get("checks") or []
-                    if not item.get("problems") and not item.get("limitation")]
+        complete = _filled_templates(program)
         if len(complete) == 1:
             return complete[0]
     return None
@@ -53,22 +58,34 @@ def _template_by_name(templates: list[dict[str, Any]], name: str) -> dict[str, A
     return next((item for item in templates if item.get("name") == name), None)
 
 
-def pending_fields(template: dict[str, Any], check: dict[str, Any]) -> list[dict[str, Any]]:
-    """程序尚未确认已填写的必填文本字段。下拉框和复选框留给结构检查。"""
+def text_fields(template: dict[str, Any], check: dict[str, Any]) -> list[dict[str, Any]]:
+    """必填文本字段及程序结论。下拉框和复选框留给结构检查，不交给模型改判。"""
     reasons = {item["field"]: item["reason"] for item in check.get("problems") or []}
-    pending = []
+    items = []
     for field in _fields(template):
         if field["type"] in {"dropdown", "checkboxes"}:
             continue
         if not field.get("validations", {}).get("required"):
             continue
         label = field["attributes"]["label"].strip()
-        if reasons.get(label) in {"missing_section", "empty_section"}:
-            pending.append({
-                "label": label,
-                "description": field["attributes"].get("description") or "",
-            })
-    return pending
+        reason = reasons.get(label)
+        if reason == "missing_section":
+            program = "missing"
+        elif reason == "empty_section":
+            program = "empty"
+        else:
+            program = "filled"
+        items.append({
+            "label": label,
+            "description": field["attributes"].get("description") or "",
+            "program": program,
+        })
+    return items
+
+
+def pending_fields(template: dict[str, Any], check: dict[str, Any]) -> list[dict[str, Any]]:
+    """程序尚未确认已填写的必填文本字段。"""
+    return [item for item in text_fields(template, check) if item["program"] != "filled"]
 
 
 def structure_problems(check: dict[str, Any]) -> list[dict[str, str]]:
@@ -97,8 +114,11 @@ def _clean_model(raw: dict[str, Any] | None, names: set[str], segments: list[dic
     if not isinstance(raw, dict):
         return None
     ids = _segment_ids(segments)
+    supplied_conflicts = raw.get("conflicts")
+    if not isinstance(supplied_conflicts, list):
+        return None
     conflicts = []
-    for item in raw.get("conflicts") or []:
+    for item in supplied_conflicts:
         if not isinstance(item, dict):
             continue
         left, right = item.get("left"), item.get("right")
@@ -107,24 +127,21 @@ def _clean_model(raw: dict[str, Any] | None, names: set[str], segments: list[dic
             continue
         conflicts.append({"kind": item["kind"], "left": left, "right": right, "note": note})
     if conflicts_only:
-        if not isinstance(raw.get("conflicts"), list):
-            return None
         return {"conflicts": conflicts}
     fit = raw.get("template_fit")
     if fit not in _FITS:
         return None
-    template = raw.get("template")
-    if template is not None and template not in names:
-        template = None
+    supplied_template = raw.get("template")
+    template = supplied_template if supplied_template in names else None
     reason = _plain(raw.get("reason"), 500)
     maintainer = _plain(raw.get("maintainer"), 500)
     if fit == "not_applicable" and maintainer is None:
         return None
     if reason is None:
         return None
-    if fit == "wrong" and template is None:
-        return None
     if fit == "correct" and template is None:
+        return None
+    if fit == "wrong" and supplied_template is not None and template is None:
         return None
     fields = []
     seen: set[str] = set()
@@ -149,15 +166,30 @@ def _clean_model(raw: dict[str, Any] | None, names: set[str], segments: list[dic
             "fields": fields, "conflicts": conflicts}
 
 
+def _review_of(pending_label: str, fields: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """把模型对程序待定字段的复核挂回去。全称优先，并忽略末尾的必填、选填提示。"""
+    exact = [item for item in fields if item.get("field") == pending_label]
+    if exact:
+        return exact[0]
+    key = _section_key(pending_label)
+    for item in fields:
+        field = item.get("field")
+        if isinstance(field, str) and _section_key(field) == key:
+            return item
+    return None
+
+
 def _content_gaps(template: dict[str, Any], check: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """必填文本字段以模型结论为准；模型没有提到的待定字段视为未提供。"""
-    by_label = {item["field"]: item for item in fields if isinstance(item.get("field"), str)}
+    """模型复核每项必填文本。程序已填写且模型未改判的保留；模型确认已提供且证据有效的去掉。"""
     gaps = []
-    for pending in pending_fields(template, check):
-        found = by_label.get(pending["label"])
-        if found is None or found["status"] != "answered":
-            ask = (found or {}).get("ask") or "请补充具体内容"
-            gaps.append({"field": pending["label"], "message": ask})
+    for item in text_fields(template, check):
+        found = _review_of(item["label"], fields)
+        if item["program"] == "filled" and found is None:
+            continue
+        if found is not None and found["status"] == "answered":
+            continue
+        ask = (found or {}).get("ask") or item["description"] or "请补充具体内容"
+        gaps.append({"field": item["label"], "message": ask})
     return gaps
 
 
@@ -183,7 +215,7 @@ def decide_review(
     """把程序结果和模型输出收成评论、标签和 status 都能用的一份决定。
 
     输出无法识别时返回 fallback，由调用方按可重试错误交回任务队列。
-    模板用错、没有适用模板或信息不足时，不再采用完整性和冲突结论。
+    有建议模板时，同时保留该模板的完整性结论和正文冲突。没有建议模板时，只保留冲突。
     """
     problems = template_problems or []
     names = {item["name"] for item in templates}
@@ -198,26 +230,12 @@ def decide_review(
     current = current_template(program)
     fit = cleaned["template_fit"]
     chosen = cleaned["template"]
-    if fit == "correct" and current is not None:
-        chosen = current
+    # 模型确认用对时以模型指向的模板为准，程序没识别到或识别错了都由模型校准。
+    if fit == "correct" and chosen:
+        current = chosen
     assessment = {"template_fit": fit, "template": chosen, "fallback": None}
     if fit == "wrong" and current is not None and chosen == current:
         return {"fallback": "program"}
-    if fit == "wrong":
-        return _result(
-            status="no_match", recommendation_status="recommended", label_verdict="failed",
-            comment_kind="template", comment_parts={"reason": cleaned["reason"], "template": chosen},
-            maintainer=None, assessment=assessment,
-            recommendation={"status": "recommended", "template": chosen, "reason": cleaned["reason"],
-                            "maintainer": None})
-    if fit == "not_applicable":
-        return _result(
-            status="no_match", recommendation_status="not_applicable", label_verdict="passed",
-            comment_kind="none", comment_parts={},
-            maintainer={"reason": cleaned["reason"] or "", "suggestion": cleaned["maintainer"]},
-            assessment=assessment,
-            recommendation={"status": "not_applicable", "template": None, "reason": cleaned["reason"],
-                            "maintainer": cleaned["maintainer"]})
     if fit == "insufficient_info":
         return _result(
             status="no_match", recommendation_status="insufficient_info", label_verdict="failed",
@@ -225,15 +243,41 @@ def decide_review(
             maintainer=None, assessment=assessment,
             recommendation={"status": "insufficient_info", "template": None, "reason": cleaned["reason"],
                             "maintainer": None})
+    if fit == "not_applicable" or (fit == "wrong" and not chosen):
+        conflicts = cleaned["conflicts"]
+        assessment["conflicts"] = conflicts
+        suggestion = cleaned["maintainer"] or "请增加能覆盖这类诉求的模板。"
+        maintainer = {"reason": cleaned["reason"] or "", "suggestion": suggestion}
+        recommendation = {"status": "not_applicable", "template": None, "reason": cleaned["reason"],
+                          "maintainer": suggestion}
+        if conflicts:
+            return _result(
+                status="no_match", recommendation_status="not_applicable", label_verdict="failed",
+                comment_kind="conflict", comment_parts={"conflicts": conflicts},
+                maintainer=maintainer, assessment=assessment, recommendation=recommendation)
+        return _result(
+            status="no_match", recommendation_status="not_applicable", label_verdict="passed",
+            comment_kind="none", comment_parts={},
+            maintainer=maintainer, assessment=assessment, recommendation=recommendation)
+    suggest = fit == "wrong" and bool(chosen)
     template = _template_by_name(templates, chosen)
     check = _check_for(program, chosen)
     if template is None:
         return {"fallback": "program"}
     gaps = _content_gaps(template, check, cleaned["fields"])
-    structural = structure_problems(check)
+    structural = [] if suggest else structure_problems(check)
     conflicts = cleaned["conflicts"]
     assessment.update({"fields": cleaned["fields"], "conflicts": conflicts, "content_gaps": gaps,
                        "structure": structural})
+    if suggest:
+        return _result(
+            status="no_match", recommendation_status="recommended", label_verdict="failed",
+            comment_kind="template",
+            comment_parts={"reason": cleaned["reason"], "template": chosen, "content": gaps,
+                           "conflicts": conflicts},
+            maintainer=None, assessment=assessment,
+            recommendation={"status": "recommended", "template": chosen, "reason": cleaned["reason"],
+                            "maintainer": None})
     if not gaps and not structural and not conflicts:
         return _result(
             status="pass", recommendation_status=None, label_verdict="passed",
@@ -252,7 +296,7 @@ def review_payload(title: str, body: str, templates: list[dict[str, Any]], progr
         return {"mode": "conflicts", "issue": {"title": title, "segments": segments}}
     current = current_template(program)
     selected = _template_by_name(templates, current) if current else None
-    pending = pending_fields(selected, _check_for(program, current)) if selected is not None and current else []
+    reviewed = text_fields(selected, _check_for(program, current)) if selected is not None and current else []
     described = []
     for template in templates:
         described.append({
@@ -264,13 +308,15 @@ def review_payload(title: str, body: str, templates: list[dict[str, Any]], progr
                         "required": bool(field.get("validations", {}).get("required")),
                         "type": field["type"]}
                        for field in _fields(template)],
+            "text_fields": text_fields(template, _check_for(program, template["name"])),
         })
     return {
         "mode": "review",
         "issue": {"title": title, "segments": segments},
         "current_template": current,
         "program_status": program.get("status"),
-        "pending_fields": pending,
+        "text_fields": reviewed,
+        "pending_fields": [item for item in reviewed if item["program"] != "filled"],
         "templates": described,
     }
 

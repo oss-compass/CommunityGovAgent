@@ -404,7 +404,7 @@ class TemplateSelectionTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial_match")
         self.assertEqual(result["matched_templates"], [template["name"]])
         self.assertEqual([p["reason"] for p in result["checks"][0]["problems"]], ["title_prefix"])
-        self.assertIn("标题应以", compliance_comment.format_compliance_check(result))
+        self.assertIn("标题请以", compliance_comment.format_compliance_check(result))
         for missing in headings:
             with self.subTest(missing=missing):
                 incomplete = "\n".join(f"### {label}\n{contents[label]}" for label in headings if label != missing)

@@ -49,7 +49,7 @@ title_closed_boundary:
 body_match_min_required_sections: 2
 
 messages:
-  title_prefix: "标题应以 {prefix!r} 开头"
+  title_prefix: "标题请以 {prefix} 开头"
   missing_section: "缺少此必填章节"
   unchecked_any: "请至少勾选一个选项"
   unchecked_option: "请勾选必选项："

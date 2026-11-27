@@ -213,7 +213,8 @@ class AnalysisTests(unittest.TestCase):
                     compliance_check, "check_issue") as check:
                 result = analysis.analyze_issue("标题", "正文", [], "key", repository="example/repo", number=18,
                                                 maintainers=maintainers, previously_commented=True)
-            self.assertEqual(result["summary"], {"status": "template_error", "recommendation_status": None})
+            self.assertEqual(result["summary"], {"status": "template_error", "recommendation_status": None,
+                                                  "label_verdict": "passed"})
             self.assertFalse(result["publish_comment"])
             self.assertEqual(result["comment"], "")
             saved = result["maintainer_suggestion"]
@@ -223,6 +224,26 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(json.loads(saved["mtr"]), list(maintainers))
             recommend.assert_not_called()
             check.assert_not_called()
+
+    def test_no_usable_template_passes_clean_text_and_comments_on_a_conflict(self):
+        body = "环境写的是 1.0\n\n日志里是 2.0"
+        clean = {"conflicts": []}
+        conflict = {"conflicts": [{"kind": "version_env", "left": "S1", "right": "S2",
+                                   "note": "环境与日志中的版本不一致"}]}
+        with patch.object(compliance_assess, "consult", return_value=clean):
+            quiet = analysis.analyze_issue("标题", body, [], "key", "model", "https://model.example",
+                                           repository="example/repo", number=18)
+        self.assertEqual(quiet["summary"]["label_verdict"], "passed")
+        self.assertFalse(quiet["publish_comment"])
+        self.assertEqual(quiet["comment"], "")
+        self.assertIn("未找到可用的", quiet["maintainer_suggestion"]["reason"])
+        with patch.object(compliance_assess, "consult", return_value=conflict):
+            flagged = analysis.analyze_issue("标题", body, [], "key", "model", "https://model.example",
+                                             repository="example/repo", number=18)
+        self.assertEqual(flagged["summary"]["label_verdict"], "failed")
+        self.assertTrue(flagged["publish_comment"])
+        self.assertIn("环境与日志中的版本不一致", flagged["comment"])
+        self.assertNotIn("模板", flagged["comment"])
 
     def test_invalid_template_files_save_source_and_diagnosis(self):
         """损坏的模板记入维护者建议，其余可用模板继续检查。
@@ -247,9 +268,11 @@ class AnalysisTests(unittest.TestCase):
                     result = analysis.analyze_issue("标题", "正文", files, "key", repository="example/repo", number=18,
                                                     maintainers=("alice",))
                 self.assertEqual(result["summary"]["status"], "no_match")
-                self.assertEqual(result["summary"]["label_verdict"], "unchanged")
-                self.assertFalse(result["publish_comment"])
-                self.assertEqual(result["comment"], "")
+                self.assertEqual(result["summary"]["label_verdict"], "failed")
+                self.assertTrue(result["publish_comment"])
+                self.assertIn("请使用以下模板提交内容", result["comment"])
+                self.assertIn("缺陷反馈", result["comment"])
+                self.assertNotIn(message, result["comment"])
                 saved = result["maintainer_suggestion"]
                 self.assertIn(source, saved["reason"])
                 self.assertIn(message, saved["reason"])

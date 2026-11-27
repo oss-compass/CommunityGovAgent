@@ -90,7 +90,7 @@ class FeedbackTests(unittest.TestCase):
                                           templates=templates)
         self.assertIn("### 提交内容规范性检查：未通过", comment)
         self.assertIn(reason, comment)
-        self.assertIn("请补充具体诉求", comment)
+        self.assertIn("请补充具体内容后", comment)
         self.assertEqual(comment.count("<details>"), 3)
         self.assertEqual(comment.count("</details>"), 3)
         self.assertIn("<summary>缺陷反馈：点击展开", comment)

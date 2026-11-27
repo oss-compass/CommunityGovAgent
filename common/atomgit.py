@@ -25,6 +25,17 @@ TRANSIENT_STATUS = frozenset({502, 503, 504})
 TEMPLATE_CACHE_SECONDS = 60
 
 
+def _posted_after(candidate: dict, baseline: dict) -> bool:
+    """candidate 是否晚于 baseline。有创建时间时按时间，否则按递增的评论编号。"""
+    left, right = candidate.get("created_at"), baseline.get("created_at")
+    if isinstance(left, str) and isinstance(right, str) and left and right:
+        return left > right
+    left_id, right_id = candidate.get("id"), baseline.get("id")
+    if type(left_id) is int and type(right_id) is int:
+        return left_id > right_id
+    return True
+
+
 def retry_after_seconds(value: str | None) -> float:
     """将 Retry-After 转成等待秒数。
 
@@ -286,6 +297,22 @@ class AtomGit:
         """
         return self.find_comment(repository, number, marker) is not None
 
+    def _each_comment(self, repository: str, number: int):
+        """按页读出 Issue 评论。查询失败或格式无效时抛出错误。"""
+        page = 1
+        while True:
+            query = urlencode({"page": page, "per_page": 100, "order": "desc"})
+            comments = self.request("GET", f"/repos/{repository}/issues/{number}/comments?{query}")
+            if not isinstance(comments, list):
+                raise IssueProcessingError("评论查询响应格式不正确")
+            for comment in comments:
+                if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                    raise IssueProcessingError("评论查询内容格式不正确")
+                yield comment
+            if len(comments) < 100:
+                return
+            page += 1
+
     def find_comment(self, repository: str, number: int, marker: str) -> dict | None:
         """分页按持久化的完整标记查找本服务评论。
 
@@ -298,20 +325,32 @@ class AtomGit:
         Raises:
             IssueProcessingError: 查询请求失败或评论响应格式无效。
         """
-        page = 1
-        while True:
-            query = urlencode({"page": page, "per_page": 100, "order": "desc"})
-            comments = self.request("GET", f"/repos/{repository}/issues/{number}/comments?{query}")
-            if not isinstance(comments, list):
-                raise IssueProcessingError("评论查询响应格式不正确")
-            for comment in comments:
-                if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
-                    raise IssueProcessingError("评论查询内容格式不正确")
-                if marker in comment["body"].splitlines():
-                    return comment
-            if len(comments) < 100:
+        for comment in self._each_comment(repository, number):
+            if marker in comment["body"].splitlines():
+                return comment
+        return None
+
+    def revisable_comment(self, repository: str, number: int, markers: list[str]) -> dict | None:
+        """上一条本服务评论之后没有其他评论时，返回可以原地修改的那一条。
+
+        Args:
+            repository: 目标仓库路径，格式为 owner/repo。
+            number: 仓库内的 Issue 编号。
+            markers: 按从新到旧排列的隐藏标记。尚未发布的标记会跳过。
+        Returns:
+            仍是最后一条评论的服务评论；不存在，或其后已有其他评论时返回 None。
+        """
+        comments = list(self._each_comment(repository, number))
+        for marker in markers:
+            if not marker:
+                continue
+            ours = next((item for item in comments if marker in item["body"].splitlines()), None)
+            if ours is None:
+                continue
+            if any(_posted_after(item, ours) for item in comments if item.get("id") != ours.get("id")):
                 return None
-            page += 1
+            return ours
+        return None
 
     def create_comment(self, repository: str, number: int, body: str) -> str:
         """发布一条新的检查评论。

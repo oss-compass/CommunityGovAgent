@@ -7,14 +7,14 @@ passed: |-
 review_passed: |-
   ### 提交内容检查：通过
 
-  当前内容已经符合要求，可以继续处理。
+  当前提交内容符合要求，可以继续处理。
 
 review_template: |-
   ### 提交内容检查：未通过
 
   {reason}
 
-  请改用 **{name}**，展开下面的内容复制到 Issue 中填写。
+  请改用模板 **{name}**。请展开以下内容，复制后替换现有正文。
 
   {template}
 
@@ -23,7 +23,14 @@ review_insufficient: |-
 
   {reason}
 
-  请补充具体诉求后，从下面选择一份模板填写。
+  请补充具体内容后，从以下模板中选择一份填写。
+
+  {templates}
+
+review_unmatched: |-
+  ### 提交内容检查：未通过
+
+  请使用以下模板提交内容。
 
   {templates}
 
@@ -74,7 +81,7 @@ insufficient_info: |-
   #### 模板推荐：请补充信息后选择
 
   <details>
-  <summary>请补充具体诉求，并从下方选择合适的模板填写。</summary>
+  <summary>请补充具体内容后，从下方选择合适的模板填写。</summary>
 
   {templates}
   

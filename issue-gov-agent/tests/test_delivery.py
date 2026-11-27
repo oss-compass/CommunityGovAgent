@@ -58,6 +58,18 @@ class DeliveryTests(unittest.TestCase):
             return deepcopy(self.comments)
         if method == 'GET':
             return deepcopy(self.issue)
+        if method == 'PATCH' and '/comments/' in path:
+            comment_id = int(path.rsplit('/', 1)[-1])
+            matched = next((item for item in self.comments if item['id'] == comment_id), None)
+            if matched is None:
+                raise IssueProcessingError('评论不存在', status_code=404)
+            if not self.post_error or self.accept_before_error:
+                matched['body'] = data['body']
+            if self.during_post:
+                self.during_post()
+            if self.post_error:
+                raise self.post_error
+            return matched
         self.assertEqual(method, 'POST')
         self.posts.append(deepcopy(data))
         if not self.post_error or self.accept_before_error:
@@ -116,7 +128,7 @@ class DeliveryTests(unittest.TestCase):
         self.process(101)
         self.assertEqual(self.analysis.call_count, 2)
         self.assertEqual(self.analysis.call_args.args[1], '新到达的修改')
-        self.assertEqual(len(self.comments), 2)
+        self.assertEqual(len(self.comments), 1)
 
     def test_edit_during_analysis_never_publishes_stale_result(self):
         self.post('first')
@@ -241,7 +253,7 @@ class DeliveryTests(unittest.TestCase):
         self.post_error = None
         self.process(131)
         self.assertEqual(self.analysis.call_count, 3)
-        self.assertEqual(len(self.comments), 3)
+        self.assertEqual(len(self.comments), 1)
         self.assertEqual(self.analysis.call_args.args[1], '最新正文')
         self.assertEqual(self.rows('pending_comments'), [])
         self.assertEqual([row['state'] for row in self.rows()], ['completed', 'superseded', 'completed'])
@@ -261,7 +273,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(worker.retry_failed(self.config), 1)
         self.assertTrue(self.process(200))
         self.assertEqual(self.analysis.call_count, 3)
-        self.assertEqual(len(self.comments), 3)
+        self.assertEqual(len(self.comments), 1)
         self.assertEqual(self.rows('pending_comments'), [])
 
     def test_database_failure_after_publication_recovers_without_duplicate(self):
@@ -372,7 +384,7 @@ class DeliveryTests(unittest.TestCase):
         self.process(101)
         self.assertEqual(self.rows()[:2], history)
         self.assertEqual([r['state'] for r in self.rows()], ['completed', 'completed', 'superseded', 'completed'])
-        self.assertEqual(len(self.comments), 3)
+        self.assertEqual(len(self.comments), 1)
 
     def test_old_failure_cannot_fail_new_edit_and_global_cooldown_is_preserved(self):
         """旧检查报错时，新修改仍待处理；限流等待仍由全局记录约束。
@@ -413,7 +425,7 @@ class DeliveryTests(unittest.TestCase):
         Args:
             无。
         Returns:
-            None；验证重启后处理最新版本并保留两次编辑的历史评论。
+            None；验证重启后处理最新版本，并在没有后续评论时修改上一条评估评论。
         """
         self.post('first')
         def edit():
@@ -438,7 +450,7 @@ class DeliveryTests(unittest.TestCase):
         self.process(101)
         self.assertEqual(len(self.rows()), 2)
         self.assertEqual(self.rows()[-1]['state'], 'completed')
-        self.assertEqual(len(self.comments), 2)
+        self.assertEqual(len(self.comments), 1)
         self.assertEqual(self.analysis.call_args.args[1], self.issue['body'])
 
 
