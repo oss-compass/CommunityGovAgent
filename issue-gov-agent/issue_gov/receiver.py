@@ -187,7 +187,8 @@ def create_app(config: Config | None = None) -> Flask:
             identity = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         event_id = hashlib.sha256((repository + ":" + identity).encode()).hexdigest()
 
-        # 将任务保存到数据库。服务模式下先记为 dispatching，避免重试投递线程重复发布。
+        # 将任务保存到数据库。服务模式下先记为 queued，并给投递留出宽限，避免重试线程同时再发一条。
+        # 代理确认后再改为 dispatching。投递前进程退出时任务仍是 queued，由重试线程补投。
         added = False
         stored_state = ""
         try:
@@ -209,13 +210,15 @@ def create_app(config: Config | None = None) -> Flask:
                                   WHERE repository = ? AND issue_number = ?
                                     AND state IN ('queued', 'running', 'failed', 'dispatching')""",
                                (repository, number))
-                    initial_state = "dispatching" if config.rabbitmq_url else "queued"
+                    now = time.time()
+                    # 宽限内由本次请求投递。失败或进程退出后 next_attempt 到期，重试线程再投。
+                    next_attempt = now + 120 if config.rabbitmq_url else (previous["next_attempt"] if previous else 0)
                     db.execute("""INSERT INTO events(event_id, repository, issue_number, updated_at,
                                                     attempts, next_attempt, state, checks)
                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                               (event_id, repository, number, time.time(),
+                               (event_id, repository, number, now,
                                 previous["attempts"] if previous else 0,
-                                previous["next_attempt"] if previous else 0, initial_state,
+                                next_attempt, "queued",
                                 dump_checks(default_checks())))
         except (sqlite3.Error, DatabaseError):
             LOG.error("通知保存失败：仓库=%s，Issue=#%s，数据库写入失败，请检查磁盘空间和目录权限",
@@ -223,7 +226,7 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify(error="queue unavailable"), 503
 
         # 新任务，或上次投递失败后仍停在 queued 的重复通知，才发布到队列。
-        # 已经是 dispatching 的重复通知不重复发布，由消费者或超时回收处理。
+        # 已经是 dispatching 的重复通知不重复发布，队列里那一份会由消费者领取。
         if config.rabbitmq_url and (added or stored_state == "queued"):
             try:
                 publish_analysis_task(config.rabbitmq_url, event_id, repository, number, checks, ISSUE_ANALYSIS)
@@ -233,8 +236,7 @@ def create_app(config: Config | None = None) -> Flask:
                 LOG.error("通知已保存但未能投递到消息队列：仓库=%s，Issue=#%s，事件=%s",
                           repository, number, event_id[:12])
                 return jsonify(error="queue unavailable"), 503
-            if not added:
-                _mark_dispatching(config, event_id)
+            _mark_dispatching(config, event_id)
 
         LOG.info("%s：仓库=%s，Issue=#%s，事件=%s",
                  "收到通知，已加入队列" if added else "收到重复通知，已去重，不再新增任务",
@@ -275,7 +277,8 @@ def _release_dispatch(config: Config, event_id: str) -> None:
     """投递失败时把刚入库的任务退回 queued，等待通知方或重试线程再次投递。"""
     try:
         with connect(config) as db:
-            db.execute("UPDATE events SET state='queued' WHERE event_id=? AND state='dispatching'", (event_id,))
+            db.execute("""UPDATE events SET state='queued', next_attempt=0
+                          WHERE event_id=? AND state IN ('queued', 'dispatching')""", (event_id,))
     except (sqlite3.Error, DatabaseError):
         LOG.error("任务未能退回等待投递：事件=%s", event_id[:12])
 

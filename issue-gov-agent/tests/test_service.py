@@ -36,13 +36,13 @@ class ConfigTests(unittest.TestCase):
         self.root = root
         self.base = {
             "WEBHOOK_SECRET": "secret", "ATOMGIT_TOKEN": "token",
-            "AGENT_API_KEY": "single-key", "LLM_BASE_URL": "https://models.example",
+            "LLM_API_KEY": "single-key", "LLM_BASE_URL": "https://models.example",
             "LLM_MODEL": "model",
         }
 
     def test_single_key_keeps_task_retry_and_ignores_service_urls(self):
         env = {**self.base, "DATABASE_URL": "postgresql://user:secret@db/app",
-               "RABBITMQ_URL": "amqp://user:secret@mq/%2F", "AGENT_API_KEYS": ""}
+               "RABBITMQ_URL": "amqp://user:secret@mq/%2F", "LLM_API_KEYS": ""}
         config = receiver.Config.from_env(env)
         self.assertEqual(config.agent_api_keys, ("single-key",))
         self.assertFalse(config.llm_failover)
@@ -52,7 +52,7 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("single-key", repr(config))
 
     def test_multiple_keys_and_service_mode_are_explicit(self):
-        env = {**self.base, "AGENT_API_KEYS": " key-a, key-b, key-a ",
+        env = {**self.base, "LLM_API_KEYS": " key-a, key-b, key-a ",
                "SERVICE_MODE": "queue",
                "DATABASE_URL": "postgresql://user:secret@db/app",
                "RABBITMQ_URL": "amqp://user:secret@mq/%2F",
@@ -82,7 +82,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_file_urls_do_not_enable_service_mode_without_process_flag(self):
         (self.root / ".env").write_text(
-            "WEBHOOK_SECRET=secret\nATOMGIT_TOKEN=token\nAGENT_API_KEY=single-key\n"
+            "WEBHOOK_SECRET=secret\nATOMGIT_TOKEN=token\nLLM_API_KEY=single-key\n"
             "LLM_BASE_URL=https://models.example\nLLM_MODEL=model\n"
             "DATABASE_URL=postgresql://user:secret@db/app\n"
             "RABBITMQ_URL=amqp://user:secret@mq/%2F\n", encoding="utf-8")

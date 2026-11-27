@@ -40,7 +40,7 @@ class ManageTests(unittest.TestCase):
         self.addCleanup(root_patch.stop)
         (self.root / ".env").write_text(
             "WEBHOOK_SECRET=test-secret\nATOMGIT_TOKEN=test-token\n"
-            "AGENT_API_KEY=test-model-key\nLLM_BASE_URL=https://models.example\nLLM_MODEL=test-model\n", encoding="utf-8",
+            "LLM_API_KEY=test-model-key\nLLM_BASE_URL=https://models.example\nLLM_MODEL=test-model\n", encoding="utf-8",
         )
         (self.root / ".env.example").write_text((self.root / ".env").read_text(), encoding="utf-8")
         directory = patch.object(manage, "DIRECTORY", self.root)
@@ -140,12 +140,12 @@ class ManageTests(unittest.TestCase):
         path = self.root / ".env"
         original = ("# 用户配置\nexport WEBHOOK_SECRET='existing-secret'\n"
                     "ATOMGIT_TOKEN=existing-token\nREPOSITORIES=example/custom\n"
-                    "AGENT_API_KEY=\nLLM_MODEL\nCUSTOM='keep me'\n"
+                    "LLM_API_KEY=\nLLM_MODEL\nCUSTOM='keep me'\n"
                     "MULTILINE='first\nNEW_SETTING=inside quoted text'")
         path.write_text(original, encoding="utf-8")
         (self.root / ".env.example").write_text(
             "WEBHOOK_SECRET=replace-with-a-random-secret\nATOMGIT_TOKEN=changed-default\n"
-            "REPOSITORIES=changed/repo\nAGENT_API_KEY=changed-key\nLLM_MODEL=changed-model\n"
+            "REPOSITORIES=changed/repo\nLLM_API_KEY=changed-key\nLLM_MODEL=changed-model\n"
             "LLM_BASE_URL=\nNEW_SETTING='${CUSTOM} # literal'\n"
             "NEW_MULTILINE='first\nsecond'\n# COMMENTED_OPTION=disabled\n", encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()) as output, patch.object(manage.secrets, "token_hex") as secret:
@@ -159,7 +159,7 @@ class ManageTests(unittest.TestCase):
         self.assertEqual(values["WEBHOOK_SECRET"], "existing-secret")
         self.assertEqual(values["ATOMGIT_TOKEN"], "existing-token")
         self.assertEqual(values["REPOSITORIES"], "example/custom")
-        self.assertEqual(values["AGENT_API_KEY"], "")
+        self.assertEqual(values["LLM_API_KEY"], "")
         self.assertIsNone(values["LLM_MODEL"])
         self.assertEqual(values["CUSTOM"], "keep me")
         self.assertEqual(values["LLM_BASE_URL"], "")
@@ -219,7 +219,7 @@ class ManageTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         from issue_gov.receiver import Config
-        inherited = {"LLM_MODEL": "wrong-model", "AGENT_API_KEY": "wrong-key", "WEBHOOK_PORT": "9999",
+        inherited = {"LLM_MODEL": "wrong-model", "LLM_API_KEY": "wrong-key", "WEBHOOK_PORT": "9999",
                      "WEBHOOK_DB": "./outside/events.sqlite3"}
         with patch.dict(os.environ, inherited, clear=True):
             env = manage.environment()
@@ -254,7 +254,7 @@ class ManageTests(unittest.TestCase):
         """缺项、空值和示例值均拒绝启动配置，不能回退到终端中的旧密钥。"""
         path = self.root / ".env"
         original = path.read_text()
-        settings = {"AGENT_API_KEY": "test-model-key", "LLM_BASE_URL": "https://models.example",
+        settings = {"LLM_API_KEY": "test-model-key", "LLM_BASE_URL": "https://models.example",
                     "LLM_MODEL": "test-model"}
         for key, value in settings.items():
             for replacement in ("", f"{key}=\n", f"{key}=   \n", f"{key}=replace-with-value\n"):

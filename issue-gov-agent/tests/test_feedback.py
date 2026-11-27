@@ -449,7 +449,7 @@ class FeedbackTests(unittest.TestCase):
             None；核对有效、空白、格式错误及缺失配置的行为。
         """
         env = {"WEBHOOK_SECRET": "secret", "ATOMGIT_TOKEN": "token", "REPOSITORIES": "ignored/legacy",
-               "AGENT_API_KEY": "model-key", "LLM_BASE_URL": "https://models.example", "LLM_MODEL": "model"}
+               "LLM_API_KEY": "model-key", "LLM_BASE_URL": "https://models.example", "LLM_MODEL": "model"}
         with tempfile.TemporaryDirectory() as directory, patch("issue_gov.paths.service_root", return_value=Path(directory)):
             path = Path(directory) / "repository.yml"
             path.write_text("example/repo:\n  - alice\n  - bob\n  - alice\nexample/other:\n  - carol\nexample/empty: []\n")

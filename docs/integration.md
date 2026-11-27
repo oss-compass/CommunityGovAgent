@@ -88,7 +88,7 @@ owner/another-repo: []
 | --- | --- |
 | `WEBHOOK_SECRET` | Webhook 密码，对应请求头 `X-GitCode-Token` |
 | `ATOMGIT_TOKEN` | 读取 Issue、模板和发表评论的服务账号令牌 |
-| `AGENT_API_KEY` 或 `AGENT_API_KEYS` | 模型密钥。多个密钥用英文逗号分隔。配置后模型参与每次检查；不配置时只做程序的模板匹配 |
+| `LLM_API_KEY` 或 `LLM_API_KEYS` | 模型密钥。多个密钥用英文逗号分隔。配置后模型参与每次检查；不配置时只做程序的模板匹配 |
 | `LLM_BASE_URL` | 模型服务地址 |
 | `LLM_MODEL` | 模型名 |
 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB` | 数据库账号。口令只用字母和数字 |
@@ -199,7 +199,7 @@ GitCode 的测试推送通常不是这种事件。密码正确时返回忽略，
 
 | HTTP | 正文 | 含义 |
 | --- | --- | --- |
-| 202 | `{"status":"queued","state":"queued"}` | 新任务已入队。队列模式下数据库先写成 `dispatching`，响应里的 `state` 仍是 `queued` |
+| 202 | `{"status":"queued","state":"queued"}` | 新任务已入队。队列模式下数据库先写成 `queued`，代理确认后再改为 `dispatching`；响应里的 `state` 仍是 `queued` |
 | 200 | `{"status":"duplicate","state":"<已有状态>"}` | 同一事件重复投递，不新建任务 |
 | 200 | `{"status":"ignored"}` | 密码正确，但不是要处理的 Issue 事件 |
 | 401 | `{"error":"unauthorized"}` | 密码错误 |

@@ -155,25 +155,22 @@ def _schema(connection) -> None:
     apply_postgres(connection)
 
 
-def claim_due(database_url: str, now: float, *, stale_after: float = 60, limit: int = 20) -> list[dict]:
-    """回收超时未领取的任务，并把到期重试任务标记为已投递。
+def claim_due(database_url: str, now: float, *, limit: int = 20) -> list[dict]:
+    """把到期的重试任务标记为已投递。
 
-    stale_after 只作用于 dispatching：接收端或重试线程已投递但尚无消费者领取的状态。
-    消费者领取后立即改为 running，正常处理中的任务不会被回收。
+    只领取 state 为 queued 且 next_attempt 已到的行。dispatching 表示消息已经在队列里，
+    消费者忙时也会停留很久，不能按停留时间再投一份。正在 running 的任务不在这里。
 
     Args:
         database_url: PostgreSQL 连接串。
         now: 当前 Unix 时间戳。
-        stale_after: 停留在 dispatching 超过该秒数后重新入队。
         limit: 单次最多领取的任务数。
     Returns:
-        已标记为 dispatching、需要重新投递到队列的任务。
+        已标记为 dispatching、需要投递到队列的任务。
     """
     import psycopg
     from psycopg.rows import dict_row
 
-    stale = """UPDATE events SET state = 'queued', next_attempt = 0
-               WHERE state = 'dispatching' AND updated_at <= %s"""
     claim = """WITH due AS (
                    SELECT event_id FROM events
                    WHERE state = 'queued' AND next_attempt <= %s
@@ -187,7 +184,6 @@ def claim_due(database_url: str, now: float, *, stale_after: float = 60, limit: 
     try:
         with psycopg.connect(database_url, row_factory=dict_row, connect_timeout=5) as raw:
             with raw.transaction():
-                raw.execute(stale, (now - stale_after,))
                 rows = raw.execute(claim, (now, limit, now)).fetchall()
     except psycopg.Error:
         raise DatabaseError("数据库不可用") from None

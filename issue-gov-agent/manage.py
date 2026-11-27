@@ -78,7 +78,7 @@ def initialize() -> None:
         with path.open("x", encoding="utf-8") as stream:
             stream.write(content)
         path.chmod(0o600)
-        print(f"已生成配置：{path}\n请填写 ATOMGIT_TOKEN，并配置大模型：AGENT_API_KEY（密钥）、LLM_BASE_URL（接口地址）和 LLM_MODEL（模型名称）。数据库和队列口令已写在同一文件中。")
+        print(f"已生成配置：{path}\n请填写 ATOMGIT_TOKEN，并配置大模型：LLM_API_KEY（密钥）、LLM_BASE_URL（接口地址）和 LLM_MODEL（模型名称）。数据库和队列口令已写在同一文件中。")
 
     # 创建仓库及维护者配置
     repository_path = DIRECTORY / "repository.yml"

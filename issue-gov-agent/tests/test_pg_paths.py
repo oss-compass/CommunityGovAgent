@@ -146,15 +146,17 @@ class PostgresPathTests(unittest.TestCase):
             state = db.execute("SELECT state FROM events").fetchone()[0]
         self.assertEqual(state, "dispatching")
 
-    def test_claim_due_recovers_stale_dispatching(self):
-        """dispatching 超过 stale_after 秒的任务应被回收重新领取。"""
+    def test_claim_due_does_not_republish_a_message_still_dispatching(self):
+        """已经在队列中的任务停留再久也不再投一份。"""
         from common.pgstore import claim_due
         now = time.time()
         self._reset(state="dispatching")
         with self.connect() as db:
             db.execute("UPDATE events SET updated_at = ?", (now - 120,))
-        rows = claim_due(self.url, now, stale_after=60)
-        self.assertEqual([row["event_id"] for row in rows], ["pg-evt-1"])
+        self.assertEqual(claim_due(self.url, now), [])
+        with self.connect() as db:
+            state = db.execute("SELECT state FROM events").fetchone()[0]
+        self.assertEqual(state, "dispatching")
 
     def test_handle_delivery_uses_shared_locking_claim(self):
         """handle_delivery 竞争领取：同 event 并发调用只处理一次（借线程池模拟）。"""

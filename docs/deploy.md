@@ -44,7 +44,7 @@ RabbitMQ
 
 口令只写在 `POSTGRES_PASSWORD` 和 `RABBITMQ_PASSWORD`。口令只用字母和数字。`init` 会把占位符换成随机值。宿主机映射端口由 `POSTGRES_PORT`、`RABBITMQ_PORT` 和 `RABBITMQ_MANAGEMENT_PORT` 决定，且只绑定在 `127.0.0.1`，不对外网开放；远程访问数据库或管理页面请走 SSH 隧道。本机直接连接时在进程环境中设置 `DATABASE_URL` 和 `RABBITMQ_URL`，不要把这两项写进 `.env`。
 
-多个模型密钥写在 `AGENT_API_KEYS`，用英文逗号分隔。鉴权失败立即换下一个密钥。超时和进程启动失败先按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试当前密钥 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换。结果格式不对只重试这次调用，不计入密钥耗尽，任务按可重试失败回到队列。密钥本身全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `AGENT_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的分类重试，密钥失败后进入死信队列。
+多个模型密钥写在 `LLM_API_KEYS`，用英文逗号分隔。鉴权失败立即换下一个密钥。超时和进程启动失败先按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试当前密钥 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换。结果格式不对只重试这次调用，不计入密钥耗尽，任务按可重试失败回到队列。密钥本身全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `LLM_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的分类重试，密钥失败后进入死信队列。
 
 首次生成配置：
 
@@ -55,7 +55,7 @@ python3 -m venv .venv
 .venv/bin/python manage.py init
 ```
 
-然后填写 `.env` 和 `repository.yml`。至少配置 `ATOMGIT_TOKEN`、`AGENT_API_KEY`（或 `AGENT_API_KEYS`）、`LLM_BASE_URL`、`LLM_MODEL`，并在 `repository.yml` 列出接入仓库。数据库和队列口令已在 `init` 时写入同一份 `.env`。
+然后填写 `.env` 和 `repository.yml`。至少配置 `ATOMGIT_TOKEN`、`LLM_API_KEY`（或 `LLM_API_KEYS`）、`LLM_BASE_URL`、`LLM_MODEL`，并在 `repository.yml` 列出接入仓库。数据库和队列口令已在 `init` 时写入同一份 `.env`。
 
 修改口令后需要同步数据库或 RabbitMQ 里的用户，或删除对应数据卷后重新创建。已经写在进程环境里的 `DATABASE_URL`、`RABBITMQ_URL` 也要一起改。
 
@@ -130,7 +130,7 @@ python3 scripts/concurrency_check.py
 | `scripts/service up` 提示容器用户无法读取配置 | 按提示 `chown <uid>` 该文件，或 `CONTAINER_UID=<uid> CONTAINER_GID=<gid> scripts/service up` |
 | `scripts/service up` 提示填写配置 | 编辑 `issue-gov-agent/.env` 和 `repository.yml` 后重试 |
 | `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康；数据库暂不可达时接收进程保持运行并每 2 秒重试，`/ready` 返回 `initializing` |
-| 任务停在 `dispatching` | 消费者未运行或队列确认失败；启动消费者后，超过 60 秒会被重新投递 |
+| 任务停在 `dispatching` | 消息已在队列中，等消费者领取。消费者未运行时启动即可，不会因为停留超时再投一份 |
 | 任务 `failed` 且 `dead_lettered=1` | 查看 `last_error` 和死信队列，修复密钥或模型配置后执行 `scripts/service retry` |
 | 修改 `.env` 或仓库名单后未生效 | `scripts/service compose restart receiver consumer`；需要重建镜像时执行 `docker compose --env-file issue-gov-agent/.env up -d --build`，副本数仍以 `consumer.deploy.replicas` 为准 |
 | 只想恢复单机 | 不要设置 `SERVICE_MODE`，继续使用 `manage.py` |

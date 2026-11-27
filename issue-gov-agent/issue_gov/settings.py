@@ -13,7 +13,7 @@ import issue_gov.paths as paths
 
 
 CONFIG_KEYS = (
-    "WEBHOOK_SECRET", "ATOMGIT_TOKEN", "AGENT_API_KEY", "AGENT_API_KEYS",
+    "WEBHOOK_SECRET", "ATOMGIT_TOKEN", "LLM_API_KEY", "LLM_API_KEYS",
     "LLM_BASE_URL", "LLM_MODEL", "LLM_KEY_RETRIES", "LLM_KEY_RETRY_INTERVAL",
     "WEBHOOK_DB", "DATABASE_URL", "RABBITMQ_URL", "SERVICE_MODE",
     "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_HOST",
@@ -154,14 +154,14 @@ class Config:
 
 
 def _model_keys(env: Mapping[str, str], required) -> tuple[tuple[str, ...], str, bool]:
-    """解析一个或多个模型密钥。只配置 AGENT_API_KEY 时不启用密钥轮换。"""
-    raw = env.get("AGENT_API_KEYS", "") or ""
+    """解析一个或多个模型密钥。只配置 LLM_API_KEY 时不启用密钥轮换。"""
+    raw = env.get("LLM_API_KEYS", "") or ""
     keys = tuple(dict.fromkeys(item.strip() for item in raw.replace("\n", ",").split(",") if item.strip()))
     if any(key.startswith("replace-with-") for key in keys):
-        raise ValueError("请配置 AGENT_API_KEYS")
+        raise ValueError("请配置 LLM_API_KEYS")
     if keys:
         return keys, keys[0], True
-    single = required("AGENT_API_KEY")
+    single = required("LLM_API_KEY")
     return (single,), single, False
 
 

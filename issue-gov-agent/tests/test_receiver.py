@@ -505,7 +505,7 @@ class ReceiverTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         env = {"WEBHOOK_SECRET": "secret", "ATOMGIT_TOKEN": "token",
-               "REPOSITORIES": "ignored/legacy", "AGENT_API_KEY": "model-secret",
+               "REPOSITORIES": "ignored/legacy", "LLM_API_KEY": "model-secret",
                "LLM_BASE_URL": "https://models.example", "LLM_MODEL": "custom"}
         config = receiver.Config.from_env(env)
         self.assertEqual(config.repositories, ("example/project", "example/another"))

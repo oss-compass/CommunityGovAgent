@@ -96,7 +96,7 @@ claude --version
 | --- | --- | --- | --- |
 | `WEBHOOK_SECRET` | 密码 | 是 | 初始化时自动生成，各接入仓库的 WebHook 页面填写相同值 |
 | `ATOMGIT_TOKEN` | 访问令牌 | 是 | 有权读取接入仓库、Issue 和模板，并创建评论的个人访问令牌 |
-| `AGENT_API_KEY` | 模型密钥 | 是 | Claude Code 兼容接口的密钥，使用 Bearer 认证 |
+| `LLM_API_KEY` | 模型密钥 | 是 | Claude Code 兼容接口的密钥，使用 Bearer 认证 |
 | `LLM_BASE_URL` | 模型接口地址 | 是 | 服务商提供的 Anthropic 兼容接口地址 |
 | `LLM_MODEL` | 模型名称 | 是 | 该接口支持的模型名称 |
 
