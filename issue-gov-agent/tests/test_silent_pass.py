@@ -133,7 +133,7 @@ class SilentPassTests(unittest.TestCase):
         self.assertEqual(self.rows("maintainer_suggestions"), [])
         self.assertEqual(self.rows("issue_checks"), [])
         self.assertEqual(self.rows("events")[0]["state"], "queued")
-        self.assertTrue(worker.process_one(self.config, now=130, client=self.client))
+        self.assertTrue(worker.process_one(self.config, now=100 + worker.RETRY_DELAY, client=self.client))
         self.assertEqual(len(self.rows("maintainer_suggestions")), 1)
         self.assertEqual(len(self.rows("issue_checks")), 1)
         self.assertEqual(self.rows("events")[0]["state"], "completed")

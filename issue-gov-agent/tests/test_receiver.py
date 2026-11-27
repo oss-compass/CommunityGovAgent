@@ -287,8 +287,8 @@ class ReceiverTests(unittest.TestCase):
         with patch.object(worker, "_process_issue", send):
             worker.process_one(self.config, now=100, client=self.api_client)
             self.assertEqual(self.rows()[0]["state"], "queued")
-            self.assertFalse(worker.process_one(self.config, now=129, client=self.api_client))
-            self.assertTrue(worker.process_one(self.config, now=130, client=self.api_client))
+            self.assertFalse(worker.process_one(self.config, now=100 + worker.RETRY_DELAY - 1, client=self.api_client))
+            self.assertTrue(worker.process_one(self.config, now=100 + worker.RETRY_DELAY, client=self.api_client))
             self.assertEqual(json.loads(self.rows()[0]["result"]), RESULT)
 
     def test_forbidden_is_failed_without_automatic_retry(self):

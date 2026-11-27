@@ -25,6 +25,8 @@ from issue_gov.settings import Config
 
 LOG = logging.getLogger("issue-gov-webhook")
 MAX_ATTEMPTS = 5  # 每个事件最多完成 5 次处理尝试；进程中断不消耗次数
+# 分析要尽快出结果。可重试失败只留出投递线程的领取空隙，不再按几十秒到数分钟退避。
+RETRY_DELAY = 5
 CHECK_PASSED_LABEL = "issue-check-passed"
 CHECK_FAILED_LABEL = "issue-check-failed"
 
@@ -494,7 +496,7 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
     """
     mark_dead = bool(exc.keys_exhausted)
     state = "queued" if exc.retryable and not mark_dead and attempt < MAX_ATTEMPTS else "failed"
-    retry_delay = min(30 * 2 ** (attempt - 1), 300)
+    retry_delay = RETRY_DELAY
     if exc.status_code == 429:
         retry_delay = max(retry_delay, math.ceil(exc.retry_after))
     with connect(config) as db:

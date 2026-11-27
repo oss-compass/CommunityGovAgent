@@ -280,8 +280,8 @@ class WorkerTests(unittest.TestCase):
             with receiver.connect(self.config) as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM maintainer_suggestions").fetchone()[0], 0)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM issue_checks").fetchone()[0], 0)
-            self.assertFalse(worker.process_one(self.config, now=129, client=client))
-            self.assertTrue(worker.process_one(self.config, now=130, client=client))
+            self.assertFalse(worker.process_one(self.config, now=100 + worker.RETRY_DELAY - 1, client=client))
+            self.assertTrue(worker.process_one(self.config, now=100 + worker.RETRY_DELAY, client=client))
             self.assertEqual(receiver.queue_snapshot(self.config)["recent"][0]["state"], "completed")
             self.assertTrue(all(call.args[0] == "GET" or "/labels" in call.args[1] for call in api.call_args_list))
         with receiver.connect(self.config) as db:
@@ -541,11 +541,11 @@ class WorkerTests(unittest.TestCase):
                     self.assertNotIn("model-key", row["last_error"] + str(logs.output))
                     self.assertNotIn("platform-key", row["last_error"] + str(logs.output))
                     publish.assert_not_called()
-                    self.assertFalse(worker.process_one(config, now=129, client=client))
+                    self.assertFalse(worker.process_one(config, now=100 + worker.RETRY_DELAY - 1, client=client))
                     popen.side_effect = None
                     process.communicate.side_effect = None
                     process.communicate.return_value = (output, "")
-                    self.assertTrue(worker.process_one(self.config, now=130, client=client))
+                    self.assertTrue(worker.process_one(self.config, now=100 + worker.RETRY_DELAY, client=client))
                     row = receiver.queue_snapshot(self.config)["recent"][0]
                     self.assertEqual(row["state"], "completed")
                     self.assertEqual(row["attempts"], 2)
