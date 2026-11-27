@@ -73,9 +73,9 @@ PostgreSQL  events / reports
 
 状态：`queued`、`dispatching`、`running`、`completed`、`failed`、`superseded`。
 
-同一 Issue 的新通知把尚未完成的旧任务标为 `superseded`。PostgreSQL 用 `pg_advisory_xact_lock` 按 Issue 串行入队。消费者领取时写入 `owner`。同一次 `running` 只允许重投接管一次；旧持有者再写完成或失败会被拒绝。
+同一 Issue 的新通知把尚未完成的旧任务标为 `superseded`。PostgreSQL 用 `pg_advisory_xact_lock` 按 Issue 串行入队。消费者领取时写入 `owner`。`running` 的分析持有会话锁；锁还在时，后来的重投不再做一遍。进程退出后锁释放，下一次重投可以再接管。旧持有者再写完成或失败会被拒绝。
 
-可重试错误最多 5 次，失败后 5 秒重新投递。平台返回 429 时按 `Retry-After` 等待，不少于这 5 秒。到期且状态为 `queued` 的任务，由消费者里的投递线程重新入队。`dispatching` 表示消息已经在队列里，不再按停留时间重复投递。正在 `running` 的任务不会被抢走。
+可重试错误最多 5 次，失败后 5 秒重新投递。平台返回 429 时按 `Retry-After` 等待，不少于这 5 秒。到期且状态为 `queued` 的任务，由消费者里的投递线程重新入队。领取时只把 `next_attempt` 推后 30 秒，代理确认之后才写成 `dispatching`。发布失败或进程退出时，还没确认的行回到可领取。新通知入库后的 5 秒宽限只拦住这次重试线程，队列里已经有的那条消息会马上分析。`dispatching` 表示这一份已经确认写入队列，不再按停留时间重复投递。
 
 评论在真正 POST/PATCH 之前先记下标记。响应丢失时，下次用这个标记到平台上查找，避免再发一条。
 

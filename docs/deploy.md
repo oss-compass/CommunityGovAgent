@@ -130,7 +130,8 @@ python3 scripts/concurrency_check.py
 | `scripts/service up` 提示容器用户无法读取配置 | 按提示 `chown <uid>` 该文件，或 `CONTAINER_UID=<uid> CONTAINER_GID=<gid> scripts/service up` |
 | `scripts/service up` 提示填写配置 | 编辑 `issue-gov-agent/.env` 和 `repository.yml` 后重试 |
 | `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康；数据库暂不可达时接收进程保持运行并每 2 秒重试，`/ready` 返回 `initializing` |
-| 任务停在 `dispatching` | 消息已在队列中，等消费者领取。消费者未运行时启动即可，不会因为停留超时再投一份 |
+| 任务停在 `dispatching` 且队列里仍有消息 | 等消费者领取。消费者未运行时启动即可，不会因为停留超时再投一份 |
+| 任务停在 `dispatching` 但队列是空的 | 旧版本可能把消息确认丢了。把这些行改回 `queued` 且 `next_attempt` 设为当前时间，由重试线程重新投递。当前版本在代理确认前不会写成 `dispatching` |
 | 任务 `failed` 且 `dead_lettered=1` | 查看 `last_error` 和死信队列，修复密钥或模型配置后执行 `scripts/service retry` |
 | 修改 `.env` 或仓库名单后未生效 | `scripts/service compose restart receiver consumer`；需要重建镜像时执行 `docker compose --env-file issue-gov-agent/.env up -d --build`，副本数仍以 `consumer.deploy.replicas` 为准 |
 | 只想恢复单机 | 不要设置 `SERVICE_MODE`，继续使用 `manage.py` |

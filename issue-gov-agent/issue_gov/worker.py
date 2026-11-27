@@ -578,6 +578,35 @@ def _log_success(repository: str, number: int, result: dict, event_id: str) -> N
              actions.get(result["comment_action"], "已处理"), label_text, event_id[:12])
 
 
+class _RunningLock:
+    """分析进行期间占住这条任务。进程退出后锁随连接释放，下一次重投可以再接管。"""
+
+    def __init__(self, database_url: str, event_id: str) -> None:
+        import hashlib
+        self._key = int.from_bytes(hashlib.sha256(event_id.encode()).digest()[:4], "big") & 0x7FFFFFFF
+        self._url = database_url
+        self._conn = None
+        self.held = False
+
+    def acquire(self) -> bool:
+        import psycopg
+        self._conn = psycopg.connect(self._url, autocommit=True, connect_timeout=5)
+        self.held = bool(self._conn.execute(
+            "SELECT pg_try_advisory_lock(%s, %s)", (8675310, self._key)).fetchone()[0])
+        return self.held
+
+    def release(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            if self.held:
+                self._conn.execute("SELECT pg_advisory_unlock(%s, %s)", (8675310, self._key))
+        finally:
+            self._conn.close()
+            self._conn = None
+            self.held = False
+
+
 def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client: AtomGit) -> str:
     """处理一条队列消息。返回 ack、nack 或 requeue。
 
@@ -589,70 +618,85 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
         LOG.warning("丢弃缺少事件编号的队列消息")
         return "ack"
     now = time.time()
-    with connect(config) as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
-        if row is None:
-            return "ack" if redelivered else "requeue"
-        state = row["state"]
-        repository, number = row["repository"], row["issue_number"]
-        if state in ("completed", "superseded"):
-            return "ack"
-        if state == "failed":
-            return "nack" if row["dead_lettered"] else "ack"
-        cooldown = db.execute("SELECT until FROM api_cooldown WHERE name = 'atomgit'").fetchone()
-        if cooldown is not None and cooldown["until"] > now and state in ("queued", "dispatching"):
-            # 只推迟尚未开始处理的任务；running 行由正在执行的消费者持有，改回 queued 会让它的完成写入落空。
-            db.execute("""UPDATE events SET state='queued', next_attempt=?
-                          WHERE event_id=? AND state IN ('queued', 'dispatching')""",
-                       (max(cooldown["until"], row["next_attempt"]), event_id))
-            return "ack"
-        if state == "queued" and row["next_attempt"] > now:
-            return "ack"
-        if state == "running" and not redelivered:
-            return "ack"
-        owner = secrets.token_hex(8)
-        if state == "running" and redelivered:
-            # 同一次 running 只接管一次。不按刚读到的 owner 交换：先提交的接管会写下新标识，
-            # 后到的消费者再读一次就能再次匹配。handoff 从 0 改为 1 后，其余重投都落空。
-            attempt = int(row["attempts"])
-            updated = db.execute("""UPDATE events SET updated_at=?, owner=?, handoff=1
-                                    WHERE event_id=? AND state='running' AND handoff=0""",
-                                 (now, owner, event_id))
-            if updated.rowcount == 0:
-                return "ack"
-        else:
-            attempt = int(row["attempts"]) + 1
-            updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?, handoff=0
-                                    WHERE event_id=? AND state IN ('queued', 'dispatching')""",
-                                 (attempt, now, owner, event_id))
-            if updated.rowcount == 0:
-                return "ack"
-
+    lock = None
     try:
-        result = _process_issue(config, repository, number, client=client, checks=payload.get("checks"))
-        if not isinstance(result, dict) or not result.get("comment_action"):
-            raise IssueProcessingError("治理程序未返回有效处理结果")
-    except Exception as error:
-        exc = error if isinstance(error, IssueProcessingError) else IssueProcessingError("治理程序发生内部错误，请检查代码和配置")
-        final, retry_delay = save_failure(config, event_id, attempt, exc, time.time(), owner=owner)
-        if final == "taken_over":
-            # 任务已被其他消费者接管：本次失败未写入，不按失败记录日志。
-            LOG.info("任务已被其他消费者接管，本次失败不再记录：仓库=%s，Issue=#%s，事件=%s",
+        with connect(config) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
+            if row is None:
+                return "ack" if redelivered else "requeue"
+            state = row["state"]
+            repository, number = row["repository"], row["issue_number"]
+            if state in ("completed", "superseded"):
+                return "ack"
+            if state == "failed":
+                return "nack" if row["dead_lettered"] else "ack"
+            cooldown = db.execute("SELECT until FROM api_cooldown WHERE name = 'atomgit'").fetchone()
+            if cooldown is not None and cooldown["until"] > now and state in ("queued", "dispatching"):
+                # 只推迟尚未开始处理的任务；running 行由正在执行的消费者持有，改回 queued 会让它的完成写入落空。
+                db.execute("""UPDATE events SET state='queued', next_attempt=?
+                              WHERE event_id=? AND state IN ('queued', 'dispatching')""",
+                           (max(cooldown["until"], row["next_attempt"]), event_id))
+                return "ack"
+            # 队列里的消息就是这一次投递，直接领取。next_attempt 只让重试线程晚一点再发新消息。
+            if state == "running" and not redelivered:
+                return "ack"
+            owner = secrets.token_hex(8)
+            if state == "running" and redelivered and config.database_url:
+                # 正在分析的进程持有锁。锁还在就说明它没退出，这份重投不能再做一遍。
+                # 进程退出后锁释放，即使 handoff 已经用过，下一次重投仍可接管。
+                lock = _RunningLock(config.database_url, event_id)
+                if not lock.acquire():
+                    lock.release()
+                    lock = None
+                    return "ack"
+                attempt = int(row["attempts"])
+                updated = db.execute("""UPDATE events SET updated_at=?, owner=?, handoff=1
+                                        WHERE event_id=? AND state='running'""",
+                                     (now, owner, event_id))
+                if updated.rowcount == 0:
+                    return "ack"
+            elif state == "running" and redelivered:
+                attempt = int(row["attempts"])
+                updated = db.execute("""UPDATE events SET updated_at=?, owner=?, handoff=1
+                                        WHERE event_id=? AND state='running' AND handoff=0""",
+                                     (now, owner, event_id))
+                if updated.rowcount == 0:
+                    return "ack"
+            else:
+                attempt = int(row["attempts"]) + 1
+                updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?, handoff=0
+                                        WHERE event_id=? AND state IN ('queued', 'dispatching')""",
+                                     (attempt, now, owner, event_id))
+                if updated.rowcount == 0:
+                    return "ack"
+
+        try:
+            result = _process_issue(config, repository, number, client=client, checks=payload.get("checks"))
+            if not isinstance(result, dict) or not result.get("comment_action"):
+                raise IssueProcessingError("治理程序未返回有效处理结果")
+        except Exception as error:
+            exc = error if isinstance(error, IssueProcessingError) else IssueProcessingError("治理程序发生内部错误，请检查代码和配置")
+            final, retry_delay = save_failure(config, event_id, attempt, exc, time.time(), owner=owner)
+            if final == "taken_over":
+                LOG.info("任务已被其他消费者接管，本次失败不再记录：仓库=%s，Issue=#%s，事件=%s",
+                         repository, number, event_id[:12])
+                return "ack"
+            _log_failure(repository, number, attempt, exc, final, retry_delay, event_id)
+            if final == "superseded":
+                return "ack"
+            if exc.keys_exhausted and final == "failed":
+                return "nack"
+            return "ack"
+        if not save_success(config, event_id, attempt, result, time.time(), owner=owner):
+            LOG.info("任务已被其他消费者接管，本次结果不写入：仓库=%s，Issue=#%s，事件=%s",
                      repository, number, event_id[:12])
             return "ack"
-        _log_failure(repository, number, attempt, exc, final, retry_delay, event_id)
-        if final == "superseded":
-            return "ack"
-        if exc.keys_exhausted and final == "failed":
-            return "nack"
+        _log_success(repository, number, result, event_id)
         return "ack"
-    if not save_success(config, event_id, attempt, result, time.time(), owner=owner):
-        LOG.info("任务已被其他消费者接管，本次结果不写入：仓库=%s，Issue=#%s，事件=%s",
-                 repository, number, event_id[:12])
-        return "ack"
-    _log_success(repository, number, result, event_id)
-    return "ack"
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def republish_due(config: Config) -> int:
@@ -669,7 +713,7 @@ def republish_due(config: Config) -> int:
         LOG.exception("读取到期任务失败")
         return 0
     published = 0
-    for row in rows:
+    for index, row in enumerate(rows):
         try:
             try:
                 tasks = [item.to_dict() for item in parse_checks(row.get("checks"))]
@@ -680,10 +724,17 @@ def republish_due(config: Config) -> int:
                 tasks, ISSUE_ANALYSIS,
             )
             published += 1
+            with connect(config) as db:
+                # 只盖住仍停在这次租约上的行。消费者已经改去重试时，不能再写成 dispatching。
+                db.execute("""UPDATE events SET state='dispatching'
+                              WHERE event_id=? AND state='queued' AND next_attempt=?""",
+                           (row["event_id"], row["next_attempt"]))
         except QueuePublishError:
             with connect(config) as db:
-                db.execute("UPDATE events SET state='queued' WHERE event_id=? AND state='dispatching'",
-                           (row["event_id"],))
+                for waiting in rows[index:]:
+                    db.execute("""UPDATE events SET next_attempt=0
+                                  WHERE event_id=? AND state='queued' AND next_attempt=?""",
+                               (waiting["event_id"], waiting["next_attempt"]))
             LOG.error("重试任务投递失败：事件=%s", str(row["event_id"])[:12])
             break
     return published

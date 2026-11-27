@@ -31,6 +31,9 @@ from issue_gov.settings import Config
 
 
 LOG = logging.getLogger("issue-gov-webhook")
+# 新通知入库后留给本次请求自己发布。重试线程在这之前不会再发一份。
+# 进程若在发布前退出，到期后由重试线程补投。一次代理确认通常远短于这个间隔。
+PUBLISH_GRACE = 5
 
 
 def select_issue(
@@ -188,15 +191,17 @@ def create_app(config: Config | None = None) -> Flask:
         event_id = hashlib.sha256((repository + ":" + identity).encode()).hexdigest()
 
         # 将任务保存到数据库。服务模式下先记为 queued，并给投递留出宽限，避免重试线程同时再发一条。
-        # 代理确认后再改为 dispatching。投递前进程退出时任务仍是 queued，由重试线程补投。
+        # 代理确认后再改为 dispatching，且只改仍停在这次宽限上的行。投递前进程退出时任务仍是 queued。
         added = False
         stored_state = ""
+        publish_stamp = None
         try:
             with connect(config) as db:
                 db.execute("BEGIN IMMEDIATE")
                 # PostgreSQL 下 BEGIN 是空操作，用按 Issue 的咨询锁让同一 Issue 的入队串行执行
                 lock_issue(db, repository, number)
-                row = db.execute("SELECT state, checks FROM events WHERE event_id = ?", (event_id,)).fetchone()
+                row = db.execute("SELECT state, checks, next_attempt FROM events WHERE event_id = ?",
+                                 (event_id,)).fetchone()
                 added = row is None
                 stored_state = "" if row is None else row["state"]
                 checks = default_checks() if row is None or not row["checks"] else json.loads(row["checks"])
@@ -212,7 +217,9 @@ def create_app(config: Config | None = None) -> Flask:
                                (repository, number))
                     now = time.time()
                     # 宽限内由本次请求投递。失败或进程退出后 next_attempt 到期，重试线程再投。
-                    next_attempt = now + 120 if config.rabbitmq_url else (previous["next_attempt"] if previous else 0)
+                    next_attempt = now + PUBLISH_GRACE if config.rabbitmq_url else (
+                        previous["next_attempt"] if previous else 0)
+                    publish_stamp = next_attempt
                     db.execute("""INSERT INTO events(event_id, repository, issue_number, updated_at,
                                                     attempts, next_attempt, state, checks)
                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -220,6 +227,8 @@ def create_app(config: Config | None = None) -> Flask:
                                 previous["attempts"] if previous else 0,
                                 next_attempt, "queued",
                                 dump_checks(default_checks())))
+                elif stored_state == "queued":
+                    publish_stamp = row["next_attempt"]
         except (sqlite3.Error, DatabaseError):
             LOG.error("通知保存失败：仓库=%s，Issue=#%s，数据库写入失败，请检查磁盘空间和目录权限",
                       repository, number)
@@ -236,7 +245,7 @@ def create_app(config: Config | None = None) -> Flask:
                 LOG.error("通知已保存但未能投递到消息队列：仓库=%s，Issue=#%s，事件=%s",
                           repository, number, event_id[:12])
                 return jsonify(error="queue unavailable"), 503
-            _mark_dispatching(config, event_id)
+            _mark_dispatching(config, event_id, publish_stamp)
 
         LOG.info("%s：仓库=%s，Issue=#%s，事件=%s",
                  "收到通知，已加入队列" if added else "收到重复通知，已去重，不再新增任务",
@@ -283,11 +292,13 @@ def _release_dispatch(config: Config, event_id: str) -> None:
         LOG.error("任务未能退回等待投递：事件=%s", event_id[:12])
 
 
-def _mark_dispatching(config: Config, event_id: str) -> None:
-    """重复通知补投成功后标记为已投递，避免重试线程再发一条。"""
+def _mark_dispatching(config: Config, event_id: str, next_attempt: float) -> None:
+    """代理确认后标记为已投递。消费者若已改过下次投递时间，说明任务已进入重试，不能再盖回。"""
     try:
         with connect(config) as db:
-            db.execute("UPDATE events SET state='dispatching' WHERE event_id=? AND state='queued'", (event_id,))
+            db.execute("""UPDATE events SET state='dispatching'
+                          WHERE event_id=? AND state='queued' AND next_attempt=?""",
+                       (event_id, next_attempt))
     except (sqlite3.Error, DatabaseError):
         LOG.error("任务已投递但状态更新失败：事件=%s", event_id[:12])
 

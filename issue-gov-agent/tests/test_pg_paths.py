@@ -133,18 +133,20 @@ class PostgresPathTests(unittest.TestCase):
         self.assertEqual(state, "completed")
         self.assertEqual(count, 1)
 
-    def test_claim_due_transitions_dispatching(self):
-        """到期任务被原子领取为 dispatching，且不重复领取。"""
+    def test_claim_due_leases_without_marking_dispatching(self):
+        """到期任务先加上发布租约，确认之前仍是 queued，且不会被领第二次。"""
         from common.pgstore import claim_due
         self._reset(state="queued")
         now = time.time()
         first = claim_due(self.url, now)
         second = claim_due(self.url, now)
         self.assertEqual([row["event_id"] for row in first], ["pg-evt-1"])
-        self.assertEqual(second, [], "同一任务不能被领取两次")
+        self.assertGreater(first[0]["next_attempt"], now)
+        self.assertEqual(second, [], "租约内的任务不能被领取两次")
         with self.connect() as db:
-            state = db.execute("SELECT state FROM events").fetchone()[0]
-        self.assertEqual(state, "dispatching")
+            row = db.execute("SELECT state, next_attempt FROM events").fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertGreater(row["next_attempt"], now)
 
     def test_claim_due_does_not_republish_a_message_still_dispatching(self):
         """已经在队列中的任务停留再久也不再投一份。"""
@@ -356,6 +358,58 @@ class PostgresPathTests(unittest.TestCase):
         with self.connect() as db:
             row = db.execute("SELECT state, attempts, handoff FROM events").fetchone()
         self.assertEqual((row["state"], row["attempts"]), ("completed", 1))
+
+    def test_redelivery_after_holder_exit_runs_again(self):
+        """持有进程已经退出时，handoff 用过的 running 任务仍可由下一次重投接管。"""
+        from unittest.mock import patch
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        with self.connect() as db:
+            db.execute("UPDATE events SET handoff = 1, owner = 'gone'")
+        config = _config(self.url)
+        with patch.object(worker, "_process_issue",
+                          return_value={"status": "pass", "comment_action": "suppressed"}) as process:
+            action = worker.handle_delivery(config, {"event_id": "pg-evt-1"}, True, client=object())
+        self.assertEqual(action, "ack")
+        process.assert_called_once()
+        with self.connect() as db:
+            row = db.execute("SELECT state, owner FROM events").fetchone()
+        self.assertEqual(row["state"], "completed")
+        self.assertIsNone(row["owner"])
+
+    def test_republish_marks_dispatching_only_after_confirm_and_releases_the_rest(self):
+        """确认之后才写成 dispatching；中途失败时，还没发出去的租约全部退回。"""
+        from dataclasses import replace
+        from unittest.mock import patch
+        from common.queueing import QueuePublishError
+        import issue_gov.worker as worker
+        self._reset(state="queued", attempts=0)
+        now = time.time()
+        with self.connect() as db:
+            for number, event_id in ((2, "pg-evt-2"), (3, "pg-evt-3")):
+                db.execute("""INSERT INTO events(event_id, repository, issue_number, updated_at,
+                                attempts, next_attempt, state, checks)
+                              VALUES (?, 'example/repo', ?, ?, 0, 0, 'queued', '[]')""",
+                           (event_id, number, now))
+        config = replace(_config(self.url), rabbitmq_url="amqp://issue:issue@localhost/%2F")
+
+        def fail_second(*_args, **_kwargs):
+            if fail_second.calls:
+                raise QueuePublishError("消息队列不可用")
+            fail_second.calls += 1
+
+        fail_second.calls = 0
+        with patch("common.queueing.publish_analysis_task", side_effect=fail_second):
+            published = worker.republish_due(config)
+        self.assertEqual(published, 1)
+        with self.connect() as db:
+            rows = {row["event_id"]: row for row in db.execute(
+                "SELECT event_id, state, next_attempt FROM events").fetchall()}
+        states = {event_id: row["state"] for event_id, row in rows.items()}
+        self.assertIn("dispatching", states.values())
+        self.assertEqual(list(states.values()).count("queued"), 2)
+        queued = [row for row in rows.values() if row["state"] == "queued"]
+        self.assertTrue(all(row["next_attempt"] == 0 for row in queued))
 
 
 if __name__ == "__main__":

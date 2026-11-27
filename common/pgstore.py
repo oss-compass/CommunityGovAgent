@@ -5,6 +5,8 @@ from typing import Iterator
 
 # 固定锁编号，避免多个接收进程同时建表。
 SCHEMA_LOCK = 8675309
+# 重试线程领走一批 queued 后、代理确认前，只推后 next_attempt，不改成 dispatching。
+PUBLISH_LEASE = 30
 
 
 class DatabaseError(Exception):
@@ -156,21 +158,23 @@ def _schema(connection) -> None:
 
 
 def claim_due(database_url: str, now: float, *, limit: int = 20) -> list[dict]:
-    """把到期的重试任务标记为已投递。
+    """领取到期的 queued 任务，准备发布。
 
-    只领取 state 为 queued 且 next_attempt 已到的行。dispatching 表示消息已经在队列里，
-    消费者忙时也会停留很久，不能按停留时间再投一份。正在 running 的任务不在这里。
+    只领取 state 为 queued 且 next_attempt 已到的行。领取时把 next_attempt 推后一个发布租约，
+    状态保持 queued。dispatching 要等代理确认之后才写，这样发布失败或进程退出都还能再领。
+    正在 running 或已经 dispatching 的任务不在这里。
 
     Args:
         database_url: PostgreSQL 连接串。
         now: 当前 Unix 时间戳。
         limit: 单次最多领取的任务数。
     Returns:
-        已标记为 dispatching、需要投递到队列的任务。
+        已加上发布租约、等待发布的任务。next_attempt 是这次租约的到期时间。
     """
     import psycopg
     from psycopg.rows import dict_row
 
+    lease = now + PUBLISH_LEASE
     claim = """WITH due AS (
                    SELECT event_id FROM events
                    WHERE state = 'queued' AND next_attempt <= %s
@@ -178,13 +182,14 @@ def claim_due(database_url: str, now: float, *, limit: int = 20) -> list[dict]:
                    FOR UPDATE SKIP LOCKED
                    LIMIT %s
                )
-               UPDATE events SET state = 'dispatching', updated_at = %s
+               UPDATE events SET next_attempt = %s, updated_at = %s
                FROM due WHERE events.event_id = due.event_id
-               RETURNING events.event_id, events.repository, events.issue_number, events.checks"""
+               RETURNING events.event_id, events.repository, events.issue_number,
+                         events.checks, events.next_attempt"""
     try:
         with psycopg.connect(database_url, row_factory=dict_row, connect_timeout=5) as raw:
             with raw.transaction():
-                rows = raw.execute(claim, (now, limit, now)).fetchall()
+                rows = raw.execute(claim, (now, limit, lease, now)).fetchall()
     except psycopg.Error:
         raise DatabaseError("数据库不可用") from None
     return [dict(row) for row in rows]

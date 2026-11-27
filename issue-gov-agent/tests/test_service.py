@@ -239,6 +239,37 @@ class QueueTests(unittest.TestCase):
         again.assert_called_once()
         self.assertEqual([row for row in self.rows() if row["issue_number"] == 13][0]["state"], "dispatching")
 
+    def test_delivered_message_runs_before_next_attempt(self):
+        """已经在队列里的消息必须开始分析，不能因为宽限时间还没到就确认丢掉。"""
+        now = time.time()
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('early', 'example/project', 21, 'queued', 0, ?, ?)""",
+                       (now + 120, now))
+        with patch.object(worker, "_process_issue", return_value=dict(RESULT)) as process:
+            action = worker.handle_delivery(self.config, {"event_id": "early"}, False, client=object())
+        self.assertEqual(action, "ack")
+        process.assert_called_once()
+        row = [item for item in self.rows() if item["event_id"] == "early"][0]
+        self.assertEqual(row["state"], "completed")
+        self.assertEqual(row["attempts"], 1)
+
+    def test_confirmed_publish_does_not_cover_a_rescheduled_retry(self):
+        """消费者已经把任务排回重试后，晚到的确认不能再把它改成 dispatching。"""
+        now = time.time()
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('moved', 'example/project', 22, 'queued', 1, ?, ?)""",
+                       (now + worker.RETRY_DELAY, now))
+        receiver._mark_dispatching(self.config, "moved", now + 30)
+        row = [item for item in self.rows() if item["event_id"] == "moved"][0]
+        self.assertEqual(row["state"], "queued")
+        receiver._mark_dispatching(self.config, "moved", now + worker.RETRY_DELAY)
+        row = [item for item in self.rows() if item["event_id"] == "moved"][0]
+        self.assertEqual(row["state"], "dispatching")
+
     def test_duplicate_dispatching_event_is_not_published_again(self):
         with patch.object(receiver, "publish_analysis_task") as publish:
             self.assertEqual(self.post().status_code, 202)
