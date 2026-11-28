@@ -142,6 +142,7 @@ def analyze_issue(
     llm_key_retries: int = 2,
     llm_key_retry_interval: float = 10,
     checks: Any = None,
+    prior_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行规范性检查，生成结果摘要与可直接发布的完整评论。
 
@@ -190,10 +191,25 @@ def analyze_issue(
     if not configured:
         return _legacy_result(program, templates, template_problems, maintainers, previously_commented)
     payload = compliance_assess.review_payload(title, body, templates, program)
-    raw = _ask_model(payload, agent_api_key, model, base_url, agent_api_keys,
-                     llm_key_retries, llm_key_retry_interval)
+    segments = payload["issue"]["segments"]
+    chosen = compliance_assess.current_template(program)
+    chosen_template = compliance_assess._template_by_name(templates, chosen) if chosen else None
+    prior = prior_snapshot if isinstance(prior_snapshot, dict) else None
+    reuse = (prior is not None and chosen_template is not None
+             and prior.get("body") == body and prior.get("template") == chosen
+             and compliance_assess.sections_unchanged(prior, chosen_template, body))
+    if reuse:
+        raw = {"template_fit": "correct", "template": chosen, "reason": "必填段落与上次相同",
+               "maintainer": None,
+               "fields": compliance_assess.fields_from_snapshot(prior, chosen_template, body, segments),
+               "conflicts": compliance_assess._remap_conflicts(prior, segments)}
+    else:
+        raw = _ask_model(payload, agent_api_key, model, base_url, agent_api_keys,
+                         llm_key_retries, llm_key_retry_interval)
+        stable_template = compliance_assess._template_by_name(templates, raw.get("template") if isinstance(raw, dict) else None)
+        raw = compliance_assess.overlay_unchanged_fields(raw, prior, stable_template, body, segments)
     decision = compliance_assess.decide_review(
-        program, templates, raw, payload["issue"]["segments"], template_problems)
+        program, templates, raw, segments, template_problems)
     if decision.get("fallback"):
         raise ProcessingError("模型未返回有效的评估结果，未能完成内容评估。", failure="invalid_output")
     kind = decision["comment_kind"]
@@ -208,6 +224,11 @@ def analyze_issue(
         comment = ""
     summary = {"status": decision["status"], "recommendation_status": decision["recommendation_status"],
                "label_verdict": decision["label_verdict"], "assessment": decision["assessment"]}
+    snapshot_template = compliance_assess._template_by_name(templates, decision["assessment"].get("template"))
+    snapshot = compliance_assess.build_snapshot(
+        snapshot_template, body, decision["assessment"], payload["issue"]["segments"])
+    if snapshot is not None:
+        summary["assessment_snapshot"] = snapshot
     return {"summary": summary, "comment": comment, "publish_comment": publish_comment,
             "maintainer_suggestion": _suggestion(template_problems, decision.get("maintainer"), maintainers)}
 
@@ -227,4 +248,5 @@ class ComplianceTool:
             maintainers=context.maintainers, previously_commented=context.previously_commented,
             agent_api_keys=context.agent_api_keys, llm_key_retries=context.llm_key_retries,
             llm_key_retry_interval=context.llm_key_retry_interval,
+            prior_snapshot=context.prior_snapshot,
         )

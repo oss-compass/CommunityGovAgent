@@ -38,7 +38,8 @@ def apply_sqlite(db) -> None:
         PRIMARY KEY (repository, issue_number)
     )""")
     columns = {row["name"] for row in db.execute("PRAGMA table_info(issue_checks)")}
-    for name, kind in (("comment_marker", "TEXT"), ("issue_updated_at", "REAL")):
+    for name, kind in (("comment_marker", "TEXT"), ("issue_updated_at", "REAL"),
+                       ("assessment_snapshot", "TEXT")):
         if name not in columns:
             db.execute(f"ALTER TABLE issue_checks ADD COLUMN {name} {kind}")
     db.execute("""CREATE TABLE IF NOT EXISTS pending_comments (
@@ -103,6 +104,7 @@ def apply_postgres(connection) -> None:
     )""")
     connection.execute("ALTER TABLE issue_checks ADD COLUMN IF NOT EXISTS comment_marker TEXT")
     connection.execute("ALTER TABLE issue_checks ADD COLUMN IF NOT EXISTS issue_updated_at DOUBLE PRECISION")
+    connection.execute("ALTER TABLE issue_checks ADD COLUMN IF NOT EXISTS assessment_snapshot TEXT")
     connection.execute("""CREATE TABLE IF NOT EXISTS pending_comments (
         repository TEXT NOT NULL, issue_number BIGINT NOT NULL, content_hash TEXT NOT NULL,
         marker TEXT NOT NULL, body TEXT NOT NULL, summary TEXT NOT NULL,

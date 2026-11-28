@@ -233,8 +233,8 @@ class DeliveryTests(unittest.TestCase):
         self.issue['body'] = '已经修改的正文'
         self.post('second')
         self.post_error = None
-        self.assertFalse(self.process(129))
-        self.process(130)
+        self.assertFalse(self.process(100 + worker.RETRY_DELAY - 1))
+        self.process(100 + worker.RETRY_DELAY)
         self.assertEqual(self.analysis.call_count, 2)
         self.assertEqual(len(self.comments), 1)
         self.assertNotEqual(self.posts[0], self.posts[1])
@@ -310,8 +310,8 @@ class DeliveryTests(unittest.TestCase):
         self.analysis.side_effect = IssueProcessingError('模型暂时不可用')
         self.process()
         self.post('late')
-        self.assertFalse(self.process(129))
-        for now in (130, 190, 310, 550):
+        self.assertFalse(self.process(100 + worker.RETRY_DELAY - 1))
+        for now in (100 + worker.RETRY_DELAY, 190, 310, 550):
             self.assertTrue(self.process(now))
         self.assertFalse(self.process(1000))
         self.assertEqual(self.analysis.call_count, 5)

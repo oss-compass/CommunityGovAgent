@@ -181,6 +181,28 @@ class DecideReviewTests(unittest.TestCase):
                 }, SEGMENTS)
                 self.assertEqual(decision["comment_parts"]["content"][0]["field"], "预期结果")
 
+    def test_partial_with_evidence_counts_as_provided(self):
+        decision = assess.decide_review(program("partial_match", [
+            {"field": "预期结果", "reason": "empty_section", "message": "此必填章节为空"},
+        ]), [TEMPLATE], {
+            "template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+            "fields": [{"field": "预期结果", "status": "partial", "evidence": ["S2"], "ask": "可以再写具体一些"}],
+            "conflicts": [],
+        }, SEGMENTS)
+        self.assertEqual(decision["status"], "pass")
+        self.assertEqual(decision["assessment"]["fields"][0]["status"], "answered")
+
+    def test_partial_with_evidence_counts_as_provided(self):
+        decision = assess.decide_review(program("partial_match", [
+            {"field": "预期结果", "reason": "empty_section", "message": "此必填章节为空"},
+        ]), [TEMPLATE], {
+            "template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+            "fields": [{"field": "预期结果", "status": "partial", "evidence": ["S2"], "ask": "可以再写具体一些"}],
+            "conflicts": [],
+        }, SEGMENTS)
+        self.assertEqual(decision["status"], "pass")
+        self.assertEqual(decision["assessment"]["fields"][0]["status"], "answered")
+
     def test_blank_label_and_duplicate_fields_are_ignored(self):
         decision = assess.decide_review(program("partial_match", [
             {"field": "预期结果", "reason": "missing_section", "message": "缺少此必填章节"},

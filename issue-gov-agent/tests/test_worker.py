@@ -132,7 +132,7 @@ class WorkerTests(unittest.TestCase):
             self.config.agent_api_key,
             self.config.llm_model, self.config.llm_base_url,
             repository="example/repo", number=12, maintainers=("qiurq1",), previously_commented=False,
-            checks=None)
+            checks=None, prior_snapshot=None)
         comment = next(c.args[2]["body"] for c in api.call_args_list
                        if c.args[0] == "POST" and c.args[1].endswith("/comments"))
         self.assertEqual(comment.split("\n\n<!-- issue-gov:")[0], output["comment"])

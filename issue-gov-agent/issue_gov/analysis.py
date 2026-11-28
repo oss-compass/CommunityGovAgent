@@ -28,6 +28,7 @@ class CheckContext:
     agent_api_keys: tuple[str, ...] | None
     llm_key_retries: int
     llm_key_retry_interval: float
+    prior_snapshot: dict[str, Any] | None = None
 
 
 def run_checks(
@@ -39,6 +40,7 @@ def run_checks(
     llm_key_retries: int = 2,
     llm_key_retry_interval: float = 10,
     checks: Any = None,
+    prior_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行消息中的检查列表。未带列表时只做规范性检查。
 
@@ -53,6 +55,7 @@ def run_checks(
         title, body, template_files, agent_api_key, model, base_url,
         repository, number, maintainers, previously_commented,
         agent_api_keys, llm_key_retries, llm_key_retry_interval,
+        prior_snapshot,
     )
     return _combine(run_tasks(context, tasks))
 

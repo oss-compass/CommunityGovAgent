@@ -193,6 +193,7 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
     publish_comment = pending_summary.pop("publish_comment", False)
     resume = (pending is not None and pending["content_hash"] == digest
               and publish_comment)
+    snapshot = None
     if resume:
         # 使用已保存的发布决定；旧记录缺少决定时重新分析。
         summary = pending_summary
@@ -206,6 +207,12 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
         has_checked_comment = checked is not None and bool(checked["comment_marker"])
         has_pending_comment = pending is not None and bool(publish_comment)
         previously_commented = has_checked_comment or has_pending_comment
+        prior_snapshot = None
+        if checked is not None and checked["assessment_snapshot"]:
+            try:
+                prior_snapshot = json.loads(checked["assessment_snapshot"])
+            except ValueError:
+                prior_snapshot = None
 
         template_files = client.templates(repository)
         recommend_with = {}
@@ -221,8 +228,10 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
             repository=repository, number=number, maintainers=config.maintainers.get(repository, ()),
             previously_commented=previously_commented,
             checks=checks,
+            prior_snapshot=prior_snapshot,
             **recommend_with)
         summary = analysis_result["summary"]
+        snapshot = summary.pop("assessment_snapshot", None)
         publish_comment = analysis_result["publish_comment"]
         suggestion = analysis_result["maintainer_suggestion"]
         if pending is not None and pending["content_hash"] == digest and publish_comment:
@@ -279,11 +288,13 @@ def _process_issue(config: Config, repository: str, number: int, *, client: Atom
                 extra["maintainer_suggestion_id"] = _save_maintainer_suggestion(
                     db, repository, number, suggestion)
             db.execute("""INSERT INTO issue_checks
-                          (repository, issue_number, content_hash, comment_marker, issue_updated_at)
-                          VALUES (?, ?, ?, ?, ?) ON CONFLICT(repository, issue_number)
+                          (repository, issue_number, content_hash, comment_marker, issue_updated_at, assessment_snapshot)
+                          VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(repository, issue_number)
                           DO UPDATE SET content_hash=excluded.content_hash, comment_marker=excluded.comment_marker,
-                                        issue_updated_at=excluded.issue_updated_at""",
-                       (repository, number, digest, saved_marker, saved_time))
+                                        issue_updated_at=excluded.issue_updated_at,
+                                        assessment_snapshot=excluded.assessment_snapshot""",
+                       (repository, number, digest, saved_marker, saved_time,
+                        json.dumps(snapshot, ensure_ascii=False) if snapshot else None))
             db.execute("DELETE FROM pending_comments WHERE repository = ? AND issue_number = ?",
                        (repository, number))
         extra.update(_assign_check_label(client, repository, number, summary))

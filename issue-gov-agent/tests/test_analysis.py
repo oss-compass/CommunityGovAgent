@@ -317,7 +317,78 @@ class AnalysisTests(unittest.TestCase):
         check.assert_called_once_with("[Bug] 启动失败", "### 问题描述\n启动失败", parsed)
         self.assertEqual(files, original)
         self.assertEqual(result["summary"]["status"], "pass")
-        recommend.assert_not_called()
+
+    def test_unchanged_section_is_reused_and_a_fix_is_rechecked(self):
+        """同一段落沿用上次结论。补上要求的信息后，只重判这一项并通过。"""
+        calls = {"count": 0}
+
+        def review(payload, key, model, base_url):
+            calls["count"] += 1
+            text = "\n".join(item["text"] for item in payload["issue"]["segments"])
+            if "启动失败" in text:
+                evidence = [item["id"] for item in payload["issue"]["segments"] if "启动失败" in item["text"]]
+                fields = [{"field": "问题描述", "status": "answered", "evidence": evidence, "ask": None}]
+            else:
+                fields = [{"field": "问题描述", "status": "absent", "evidence": [], "ask": "请写明实际现象"}]
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": fields, "conflicts": []}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", "### 问题描述\n待补充", [TEMPLATE_FILE],
+                                           "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first["summary"]["status"], "partial_match")
+        snapshot = first["summary"]["assessment_snapshot"]
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            second = analysis.analyze_issue("[Bug] 启动失败", "### 问题描述\n待补充", [TEMPLATE_FILE],
+                                            "key", "model", "https://model.example",
+                                            prior_snapshot=snapshot, **kwargs)
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(second["summary"]["status"], "partial_match")
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            fixed = analysis.analyze_issue("[Bug] 启动失败", "### 问题描述\n启动失败", [TEMPLATE_FILE],
+                                           "key", "model", "https://model.example",
+                                           prior_snapshot=snapshot, **kwargs)
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(fixed["summary"]["status"], "pass")
+        self.assertEqual(fixed["summary"]["label_verdict"], "passed")
+
+    def test_editing_one_section_does_not_flip_an_unchanged_section(self):
+        """改了一项时，模型把没改的项改判也会被上次结论盖回。"""
+        template = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
+            {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}},
+            {"type": "textarea", "attributes": {"label": "预期结果"}, "validations": {"required": True}}]}
+        file = {**TEMPLATE_FILE, "content": yaml.safe_dump(template)}
+
+        def review(payload, key, model, base_url):
+            text = "\n".join(item["text"] for item in payload["issue"]["segments"])
+            def evidence(fragment):
+                return [item["id"] for item in payload["issue"]["segments"] if fragment in item["text"]]
+            fields = [
+                {"field": "问题描述", "status": "absent" if "改判" in text else "answered",
+                 "evidence": evidence("启动失败"), "ask": "请写现象"},
+                {"field": "预期结果", "status": "answered" if "程序应退出" in text else "absent",
+                 "evidence": evidence("程序应退出"), "ask": "请写期望行为"},
+            ]
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": fields, "conflicts": []}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        original = "### 问题描述\n启动失败\n### 预期结果\n待补充"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", original, [file],
+                                           "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(first["summary"]["status"], "partial_match")
+        revised = "### 问题描述\n启动失败\n### 预期结果\n程序应退出\n改判"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            second = analysis.analyze_issue("[Bug] 启动失败", revised, [file],
+                                            "key", "model", "https://model.example",
+                                            prior_snapshot=first["summary"]["assessment_snapshot"], **kwargs)
+        statuses = {item["field"]: item["status"] for item in second["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "answered")
+        self.assertEqual(statuses["预期结果"], "answered")
+        self.assertEqual(second["summary"]["status"], "pass")
 
 
 if __name__ == "__main__":

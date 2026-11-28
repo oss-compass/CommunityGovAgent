@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from issue_gov.checks.tools.compliance.parse import _fields, _section_key
+from issue_gov.checks.tools.compliance.parse import _fields, _section_forms, _section_key, _sections
 from issue_gov.checks.tools.compliance.recommend import invoke_model
 from issue_gov.checks.tools.compliance.rules import ASSESS_PROMPT
 from issue_gov.checks.tools.compliance.segment import segment_body
@@ -157,8 +157,11 @@ def _clean_model(raw: dict[str, Any] | None, names: set[str], segments: list[dic
         evidence = [seg for seg in item.get("evidence") or [] if seg in ids]
         ask = _plain(item.get("ask"), 200)
         status = item["status"]
+        # 旧输出里的 partial 表示“提到了但觉得不够”。有证据就视为已经提供，避免同一段文字在通过和不通过之间摆动。
+        if status == "partial":
+            status = "answered"
         if status != "absent" and not evidence:
-            # 没有可核对证据的 answered 和 partial 都不能算作已提供
+            # 没有可核对证据的已回答不能算作已提供
             status = "absent"
         seen.add(label)
         fields.append({"field": label, "status": status, "evidence": evidence, "ask": ask})
@@ -177,6 +180,124 @@ def _review_of(pending_label: str, fields: list[dict[str, Any]]) -> dict[str, An
         if isinstance(field, str) and _section_key(field) == key:
             return item
     return None
+
+
+def _norm_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def required_sections(template: dict[str, Any], body: str) -> dict[str, str]:
+    """必填文本字段对应的章节正文。没有该章节时为空字符串。"""
+    labels = [field["attributes"]["label"] for field in _fields(template)
+              if field["type"] not in {"dropdown", "checkboxes"}
+              and field.get("validations", {}).get("required")]
+    field_keys = {_section_key(label) for label in labels}
+    candidates: dict[str, set[str]] = {}
+    for key in field_keys:
+        for form in _section_forms(key):
+            candidates.setdefault(form, set()).add(key)
+    names = {form: next(iter(targets)) for form, targets in candidates.items() if len(targets) == 1}
+    names.update({key: key for key in field_keys})
+    found = _sections(body, normalize_hints=True, field_keys=field_keys, field_names=names)
+    return {key: found.get(key, "") for key in field_keys}
+
+
+def _ids_in_section(segments: list[dict[str, str]], section_text: str) -> list[str]:
+    wanted = _norm_text(section_text)
+    if not wanted:
+        return []
+    return [item["id"] for item in segments
+            if _norm_text(item.get("text") or "") and _norm_text(item["text"]) in wanted]
+
+
+def build_snapshot(template: dict[str, Any] | None, body: str, assessment: dict[str, Any] | None,
+                   segments: list[dict[str, str]]) -> dict[str, Any] | None:
+    """记下本次模板、必填段落正文和字段结论，供下次沿用未改动的项。"""
+    if not template or not assessment or not assessment.get("template"):
+        return None
+    sections = required_sections(template, body)
+    by_id = {item["id"]: item.get("text") or "" for item in segments}
+    fields = {}
+    for item in assessment.get("fields") or []:
+        key = _section_key(item.get("field") or "")
+        if key not in sections or item.get("status") not in {"answered", "absent"}:
+            continue
+        fields[key] = {"field": item["field"], "status": item["status"], "ask": item.get("ask")}
+    conflicts = []
+    for item in assessment.get("conflicts") or []:
+        left, right = by_id.get(item.get("left")), by_id.get(item.get("right"))
+        if left and right and item.get("kind") in _CONFLICTS and item.get("note"):
+            conflicts.append({"kind": item["kind"], "left_text": left, "right_text": right, "note": item["note"]})
+    return {"template": assessment["template"], "body": body, "sections": sections, "fields": fields, "conflicts": conflicts}
+
+
+def sections_unchanged(snapshot: dict[str, Any] | None, template: dict[str, Any], body: str) -> bool:
+    """上次认定的模板下，每个必填段落正文都与这次相同。"""
+    if not snapshot or snapshot.get("template") != template.get("name"):
+        return False
+    current = required_sections(template, body)
+    previous = snapshot.get("sections") or {}
+    return all(current.get(key, "") == previous.get(key, "") for key in current)
+
+
+def _remap_conflicts(snapshot: dict[str, Any], segments: list[dict[str, str]]) -> list[dict[str, str]]:
+    def locate(text: str) -> str | None:
+        wanted = _norm_text(text)
+        hits = [item["id"] for item in segments if wanted and _norm_text(item.get("text") or "") == wanted]
+        return hits[0] if len(hits) == 1 else None
+
+    conflicts = []
+    for item in snapshot.get("conflicts") or []:
+        left, right = locate(item.get("left_text") or ""), locate(item.get("right_text") or "")
+        note = item.get("note")
+        if item.get("kind") in _CONFLICTS and left and right and left != right and isinstance(note, str) and note.strip():
+            conflicts.append({"kind": item["kind"], "left": left, "right": right, "note": note.strip()})
+    return conflicts
+
+
+def fields_from_snapshot(snapshot: dict[str, Any], template: dict[str, Any], body: str,
+                         segments: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """把上次字段结论改写成当前正文片段编号。段落有改动的项不在这里。"""
+    current = required_sections(template, body)
+    previous = snapshot.get("sections") or {}
+    fields = []
+    for key, item in (snapshot.get("fields") or {}).items():
+        if current.get(key, "") != previous.get(key, ""):
+            continue
+        evidence = _ids_in_section(segments, current.get(key, ""))
+        status = item.get("status")
+        if status == "answered" and not evidence:
+            continue
+        if status not in {"answered", "absent"}:
+            continue
+        fields.append({"field": item["field"], "status": status,
+                       "evidence": evidence if status == "answered" else [], "ask": item.get("ask")})
+    return fields
+
+
+def overlay_unchanged_fields(raw: dict[str, Any], snapshot: dict[str, Any] | None,
+                             template: dict[str, Any] | None, body: str,
+                             segments: list[dict[str, str]]) -> dict[str, Any]:
+    """模板未变时，用上次结论盖住没改过的必填项。改过的项保留本次模型结论。"""
+    if not snapshot or not template or not isinstance(raw, dict):
+        return raw
+    if raw.get("template_fit") != "correct" or raw.get("template") != snapshot.get("template"):
+        return raw
+    if template.get("name") != snapshot.get("template"):
+        return raw
+    carried = fields_from_snapshot(snapshot, template, body, segments)
+    if not carried:
+        return raw
+    fields = [item for item in (raw.get("fields") or []) if isinstance(item, dict)]
+    index = {_section_key(item.get("field") or ""): position for position, item in enumerate(fields)
+             if isinstance(item.get("field"), str)}
+    for item in carried:
+        key = _section_key(item["field"])
+        if key in index:
+            fields[index[key]] = item
+        else:
+            fields.append(item)
+    return {**raw, "fields": fields}
 
 
 def _content_gaps(template: dict[str, Any], check: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, str]]:
