@@ -4,7 +4,10 @@ import json
 import re
 from typing import Any
 
-from issue_gov.checks.tools.compliance.parse import _fields, _section_forms, _section_key, _sections
+from markdown_it import MarkdownIt
+
+from issue_gov.checks.tools.compliance.parse import (
+    _fields, _resolve_section_name, _section_forms, _section_key, _sections)
 from issue_gov.checks.tools.compliance.recommend import invoke_model
 from issue_gov.checks.tools.compliance.rules import ASSESS_PROMPT
 from issue_gov.checks.tools.compliance.segment import segment_body
@@ -186,8 +189,8 @@ def _norm_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def required_sections(template: dict[str, Any], body: str) -> dict[str, str]:
-    """必填文本字段对应的章节正文。没有该章节时为空字符串。"""
+def _required_index(template: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
+    """必填文本字段的匹配键，以及标题写法到字段键的映射。"""
     labels = [field["attributes"]["label"] for field in _fields(template)
               if field["type"] not in {"dropdown", "checkboxes"}
               and field.get("validations", {}).get("required")]
@@ -198,8 +201,38 @@ def required_sections(template: dict[str, Any], body: str) -> dict[str, str]:
             candidates.setdefault(form, set()).add(key)
     names = {form: next(iter(targets)) for form, targets in candidates.items() if len(targets) == 1}
     names.update({key: key for key in field_keys})
+    return field_keys, names
+
+
+def required_sections(template: dict[str, Any], body: str) -> dict[str, str]:
+    """必填文本字段对应的章节正文。没有该章节时为空字符串。"""
+    field_keys, names = _required_index(template)
     found = _sections(body, normalize_hints=True, field_keys=field_keys, field_names=names)
     return {key: found.get(key, "") for key in field_keys}
+
+
+def _preamble(template: dict[str, Any], body: str) -> str:
+    """第一个必填标题之前的正文。证据写在前言里时靠它判断这段有没有改。"""
+    tokens = MarkdownIt("commonmark").parse(body or "")
+    field_keys, names = _required_index(template)
+    first = None
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or token.level != 0:
+            continue
+        resolved = _resolve_section_name(_section_key(tokens[index + 1].content), names)
+        if resolved in field_keys:
+            first = index
+            break
+    if first is None:
+        return body or ""
+    parts = []
+    for index in range(first):
+        token = tokens[index]
+        if token.type in {"fence", "code_block"}:
+            parts.append(token.content)
+        elif token.type == "inline" and (index == 0 or tokens[index - 1].type != "heading_open"):
+            parts.append(re.sub(r"<!--[\s\S]*?-->", "", token.content))
+    return "\n".join(part.strip() for part in parts if part.strip()).strip()
 
 
 def _ids_in_section(segments: list[dict[str, str]], section_text: str) -> list[str]:
@@ -210,9 +243,68 @@ def _ids_in_section(segments: list[dict[str, str]], section_text: str) -> list[s
             if _norm_text(item.get("text") or "") and _norm_text(item["text"]) in wanted]
 
 
+def _ids_matching(segments: list[dict[str, str]], texts: list[str]) -> list[str]:
+    """按规范化后的原文找回片段编号。每段证据都要能对上。"""
+    wanted = {_norm_text(text) for text in texts if _norm_text(text)}
+    if not wanted:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in segments:
+        text = _norm_text(item.get("text") or "")
+        if text in wanted:
+            found.append(item["id"])
+            seen.add(text)
+    return found if wanted <= seen else []
+
+
+def _evidence_in_section(text: str, section_text: str) -> bool:
+    """证据原文就是这项标题下的整段、其中一行，或多行块被完整包含。"""
+    wanted = _norm_text(text)
+    if not wanted:
+        return False
+    if wanted == _norm_text(section_text):
+        return True
+    lines = {_norm_text(line) for line in section_text.splitlines() if line.strip()}
+    if wanted in lines:
+        return True
+    return "\n" in text and wanted in _norm_text(section_text)
+
+
+def _evidence_is_stable(texts: list[str], snapshot: dict[str, Any], template: dict[str, Any],
+                       body: str, segments: list[dict[str, str]]) -> bool:
+    """上次的证据原文都还在，且所在的必填项或前言没有改动。"""
+    if not texts or not _ids_matching(segments, texts):
+        return False
+    current = required_sections(template, body)
+    previous = snapshot.get("sections") or {}
+    changed = {key for key, text in current.items() if text != previous.get(key, "")}
+    preamble_same = _preamble(template, body) == _preamble(template, snapshot.get("body") or "")
+    current_preamble = _preamble(template, body)
+    for text in texts:
+        owners = [key for key, section in current.items() if section and _evidence_in_section(text, section)]
+        if owners:
+            if any(key in changed for key in owners):
+                return False
+            continue
+        if not preamble_same or not _evidence_in_section(text, current_preamble):
+            return False
+    return True
+
+
+def _has_new_evidence(field: dict[str, Any], segments: list[dict[str, str]], previous_body: str) -> bool:
+    """模型用上次正文里没有的片段说明这项已经提供。"""
+    if field.get("status") not in {"answered", "partial"}:
+        return False
+    previous = _norm_text(previous_body)
+    by_id = {item["id"]: item.get("text") or "" for item in segments}
+    return any(_norm_text(by_id[item]) not in previous
+               for item in field.get("evidence") or [] if item in by_id and _norm_text(by_id[item]))
+
+
 def build_snapshot(template: dict[str, Any] | None, body: str, assessment: dict[str, Any] | None,
-                   segments: list[dict[str, str]]) -> dict[str, Any] | None:
-    """记下本次模板、必填段落正文和字段结论，供下次沿用未改动的项。"""
+                   segments: list[dict[str, str]], *, title: str = "") -> dict[str, Any] | None:
+    """记下本次标题、模板、必填段落正文、证据原文和字段结论。"""
     if not template or not assessment or not assessment.get("template"):
         return None
     sections = required_sections(template, body)
@@ -222,13 +314,17 @@ def build_snapshot(template: dict[str, Any] | None, body: str, assessment: dict[
         key = _section_key(item.get("field") or "")
         if key not in sections or item.get("status") not in {"answered", "absent"}:
             continue
-        fields[key] = {"field": item["field"], "status": item["status"], "ask": item.get("ask")}
+        evidence_texts = [by_id[evidence] for evidence in item.get("evidence") or []
+                          if evidence in by_id and by_id[evidence].strip()]
+        fields[key] = {"field": item["field"], "status": item["status"], "ask": item.get("ask"),
+                       "evidence_texts": evidence_texts}
     conflicts = []
     for item in assessment.get("conflicts") or []:
         left, right = by_id.get(item.get("left")), by_id.get(item.get("right"))
         if left and right and item.get("kind") in _CONFLICTS and item.get("note"):
             conflicts.append({"kind": item["kind"], "left_text": left, "right_text": right, "note": item["note"]})
-    return {"template": assessment["template"], "body": body, "sections": sections, "fields": fields, "conflicts": conflicts}
+    return {"template": assessment["template"], "title": title, "body": body,
+            "sections": sections, "fields": fields, "conflicts": conflicts}
 
 
 def sections_unchanged(snapshot: dict[str, Any] | None, template: dict[str, Any], body: str) -> bool:
@@ -255,40 +351,106 @@ def _remap_conflicts(snapshot: dict[str, Any], segments: list[dict[str, str]]) -
     return conflicts
 
 
+def _carried_field(item: dict[str, Any], evidence: list[str]) -> dict[str, Any]:
+    status = item.get("status")
+    return {"field": item["field"], "status": status,
+            "evidence": evidence if status == "answered" else [], "ask": item.get("ask")}
+
+
 def fields_from_snapshot(snapshot: dict[str, Any], template: dict[str, Any], body: str,
                          segments: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """把上次字段结论改写成当前正文片段编号。段落有改动的项不在这里。"""
+    """整篇未改时，把上次字段结论改写成当前片段编号。证据可以在其他项里。"""
     current = required_sections(template, body)
     previous = snapshot.get("sections") or {}
     fields = []
     for key, item in (snapshot.get("fields") or {}).items():
         if current.get(key, "") != previous.get(key, ""):
             continue
-        evidence = _ids_in_section(segments, current.get(key, ""))
         status = item.get("status")
-        if status == "answered" and not evidence:
-            continue
         if status not in {"answered", "absent"}:
             continue
-        fields.append({"field": item["field"], "status": status,
-                       "evidence": evidence if status == "answered" else [], "ask": item.get("ask")})
+        evidence: list[str] = []
+        if status == "answered":
+            if "evidence_texts" in item:
+                evidence = _ids_matching(segments, item.get("evidence_texts") or [])
+            else:
+                evidence = _ids_in_section(segments, current.get(key, ""))
+            if not evidence:
+                continue
+        fields.append(_carried_field(item, evidence))
     return fields
+
+
+def _fields_to_carry(snapshot: dict[str, Any], template: dict[str, Any], body: str,
+                     segments: list[dict[str, str]], raw_fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """正文有变化时，证据所在位置没改则沿用已提供。新证据留给模型。"""
+    current = required_sections(template, body)
+    previous = snapshot.get("sections") or {}
+    model_fields: dict[str, dict[str, Any]] = {}
+    for item in raw_fields:
+        if isinstance(item, dict) and isinstance(item.get("field"), str):
+            model_fields[_section_key(item["field"])] = item
+    carried = []
+    for key, item in (snapshot.get("fields") or {}).items():
+        if current.get(key, "") != previous.get(key, ""):
+            continue
+        status = item.get("status")
+        if status == "answered":
+            texts = item.get("evidence_texts") if "evidence_texts" in item else None
+            if not texts or not _evidence_is_stable(texts, snapshot, template, body, segments):
+                continue
+            evidence = _ids_matching(segments, texts)
+            if not evidence:
+                continue
+            carried.append(_carried_field(item, evidence))
+        elif status == "absent":
+            model_item = model_fields.get(key)
+            if model_item is not None and _has_new_evidence(model_item, segments, snapshot.get("body") or ""):
+                continue
+            carried.append(_carried_field(item, []))
+    return carried
+
+
+def _stabilize_conflicts(conflicts: list[Any], snapshot: dict[str, Any],
+                         segments: list[dict[str, str]]) -> list[Any]:
+    """两边都是上次已有原文、且上次没有这组原文时，丢掉新报的冲突。"""
+    previous_body = _norm_text(snapshot.get("body") or "")
+    if not previous_body:
+        return conflicts
+    known = set()
+    for item in snapshot.get("conflicts") or []:
+        pair = tuple(sorted((_norm_text(item.get("left_text") or ""), _norm_text(item.get("right_text") or ""))))
+        if all(pair):
+            known.add(pair)
+    by_id = {item["id"]: item.get("text") or "" for item in segments}
+    kept = []
+    for item in conflicts:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        left, right = by_id.get(item.get("left"), ""), by_id.get(item.get("right"), "")
+        left_text, right_text = _norm_text(left), _norm_text(right)
+        if not left_text or not right_text or left_text not in previous_body or right_text not in previous_body:
+            kept.append(item)
+            continue
+        if tuple(sorted((left_text, right_text))) in known:
+            kept.append(item)
+    return kept
 
 
 def overlay_unchanged_fields(raw: dict[str, Any], snapshot: dict[str, Any] | None,
                              template: dict[str, Any] | None, body: str,
                              segments: list[dict[str, str]]) -> dict[str, Any]:
-    """模板未变时，用上次结论盖住没改过的必填项。改过的项保留本次模型结论。"""
+    """模板未变时盖住证据仍在原处的必填项，并丢掉针对未改原文新报的冲突。"""
     if not snapshot or not template or not isinstance(raw, dict):
         return raw
     if raw.get("template_fit") != "correct" or raw.get("template") != snapshot.get("template"):
         return raw
     if template.get("name") != snapshot.get("template"):
         return raw
-    carried = fields_from_snapshot(snapshot, template, body, segments)
-    if not carried:
-        return raw
-    fields = [item for item in (raw.get("fields") or []) if isinstance(item, dict)]
+    raw_fields = [item for item in (raw.get("fields") or []) if isinstance(item, dict)]
+    carried = _fields_to_carry(snapshot, template, body, segments, raw_fields)
+    fields = list(raw_fields)
     index = {_section_key(item.get("field") or ""): position for position, item in enumerate(fields)
              if isinstance(item.get("field"), str)}
     for item in carried:
@@ -297,7 +459,10 @@ def overlay_unchanged_fields(raw: dict[str, Any], snapshot: dict[str, Any] | Non
             fields[index[key]] = item
         else:
             fields.append(item)
-    return {**raw, "fields": fields}
+    updated = {**raw, "fields": fields}
+    if isinstance(raw.get("conflicts"), list):
+        updated["conflicts"] = _stabilize_conflicts(raw["conflicts"], snapshot, segments)
+    return updated
 
 
 def _content_gaps(template: dict[str, Any], check: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, str]]:

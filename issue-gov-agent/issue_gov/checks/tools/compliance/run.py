@@ -196,7 +196,8 @@ def analyze_issue(
     chosen_template = compliance_assess._template_by_name(templates, chosen) if chosen else None
     prior = prior_snapshot if isinstance(prior_snapshot, dict) else None
     reuse = (prior is not None and chosen_template is not None
-             and prior.get("body") == body and prior.get("template") == chosen
+             and prior.get("body") == body and prior.get("title") == title
+             and prior.get("template") == chosen
              and compliance_assess.sections_unchanged(prior, chosen_template, body))
     if reuse:
         raw = {"template_fit": "correct", "template": chosen, "reason": "必填段落与上次相同",
@@ -226,7 +227,7 @@ def analyze_issue(
                "label_verdict": decision["label_verdict"], "assessment": decision["assessment"]}
     snapshot_template = compliance_assess._template_by_name(templates, decision["assessment"].get("template"))
     snapshot = compliance_assess.build_snapshot(
-        snapshot_template, body, decision["assessment"], payload["issue"]["segments"])
+        snapshot_template, body, decision["assessment"], payload["issue"]["segments"], title=title)
     if snapshot is not None:
         summary["assessment_snapshot"] = snapshot
     return {"summary": summary, "comment": comment, "publish_comment": publish_comment,

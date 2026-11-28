@@ -390,6 +390,188 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(statuses["预期结果"], "answered")
         self.assertEqual(second["summary"]["status"], "pass")
 
+    def test_evidence_outside_a_section_follows_later_edits(self):
+        """证据在别的项、前言或新正文里时，跟这次模型的结论走。"""
+        template = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
+            {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}},
+            {"type": "textarea", "attributes": {"label": "环境"}, "validations": {"required": True}}]}
+        file = {**TEMPLATE_FILE, "content": yaml.safe_dump(template)}
+        calls = {"count": 0}
+
+        def evidence(payload, fragment):
+            return [item["id"] for item in payload["issue"]["segments"] if fragment in item["text"]]
+
+        def review(payload, key, model, base_url):
+            calls["count"] += 1
+            text = "\n".join(item["text"] for item in payload["issue"]["segments"])
+            fields = [
+                {"field": "问题描述", "status": "absent" if "改掉现象" in text else "answered",
+                 "evidence": evidence(payload, "启动失败"), "ask": "请写明实际现象"},
+                {"field": "环境", "status": "answered", "evidence": evidence(payload, "Ubuntu"), "ask": None},
+            ]
+            if "补上现象" in text:
+                fields[0] = {"field": "问题描述", "status": "partial",
+                             "evidence": evidence(payload, "启动失败"), "ask": None}
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": fields, "conflicts": []}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        original = "### 问题描述\n待补充\n### 环境\nUbuntu 上启动失败"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", original, [file],
+                                           "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(first["summary"]["status"], "pass")
+        snapshot = first["summary"]["assessment_snapshot"]
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            same = analysis.analyze_issue("[Bug] 启动失败", original, [file],
+                                          "key", "model", "https://model.example",
+                                          prior_snapshot=snapshot, **kwargs)
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(same["summary"]["status"], "pass")
+        removed = "前言仍在\n### 问题描述\n待补充\n### 环境\nUbuntu 上改掉现象"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            cleared = analysis.analyze_issue("[Bug] 启动失败", removed, [file],
+                                             "key", "model", "https://model.example",
+                                             prior_snapshot=snapshot, **kwargs)
+        statuses = {item["field"]: item["status"] for item in cleared["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "absent")
+        self.assertEqual(cleared["summary"]["status"], "partial_match")
+        added = "### 问题描述\n待补充\n### 环境\nUbuntu 上补上现象后启动失败"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            fixed = analysis.analyze_issue("[Bug] 启动失败", added, [file],
+                                           "key", "model", "https://model.example",
+                                           prior_snapshot=cleared["summary"]["assessment_snapshot"], **kwargs)
+        statuses = {item["field"]: item["status"] for item in fixed["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "answered")
+        self.assertEqual(fixed["summary"]["status"], "pass")
+
+    def test_unchanged_words_do_not_flip_or_invent_a_conflict(self):
+        """没改过的原文不能把未提供改成已提供，也不能新报一条冲突。新正文里的冲突保留。"""
+        template = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
+            {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}},
+            {"type": "textarea", "attributes": {"label": "预期结果"}, "validations": {"required": True}}]}
+        file = {**TEMPLATE_FILE, "content": yaml.safe_dump(template)}
+
+        def review(payload, key, model, base_url):
+            segments = payload["issue"]["segments"]
+            text = "\n".join(item["text"] for item in segments)
+            def ident(fragment):
+                return next(item["id"] for item in segments if fragment in item["text"])
+            fields = [
+                {"field": "问题描述", "status": "answered", "evidence": [ident("实际版本 1.0")], "ask": None},
+                {"field": "预期结果",
+                 "status": "absent" if "再看一眼" not in text and "应当版本 2.0" not in text else "answered",
+                 "evidence": [ident("应当版本")], "ask": "请写期望行为"},
+            ]
+            conflicts = []
+            if "再看一眼" in text or "应当版本 2.0" in text:
+                conflicts.append({"kind": "version_env", "left": ident("实际版本 1.0"),
+                                  "right": ident("应当版本"), "note": "版本不一致"})
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": fields, "conflicts": conflicts}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        original = "### 问题描述\n实际版本 1.0\n### 预期结果\n应当版本 1.0"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", original, [file],
+                                           "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(first["summary"]["status"], "partial_match")
+        touched = "再看一眼\n" + original
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            second = analysis.analyze_issue("[Bug] 启动失败", touched, [file],
+                                            "key", "model", "https://model.example",
+                                            prior_snapshot=first["summary"]["assessment_snapshot"], **kwargs)
+        self.assertEqual(second["summary"]["assessment"]["conflicts"], [])
+        self.assertEqual(second["summary"]["status"], "partial_match")
+        revised = "### 问题描述\n实际版本 1.0\n### 预期结果\n应当版本 2.0"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            third = analysis.analyze_issue("[Bug] 启动失败", revised, [file],
+                                           "key", "model", "https://model.example",
+                                           prior_snapshot=second["summary"]["assessment_snapshot"], **kwargs)
+        self.assertEqual(len(third["summary"]["assessment"]["conflicts"]), 1)
+        statuses = {item["field"]: item["status"] for item in third["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["预期结果"], "answered")
+        self.assertEqual(third["summary"]["status"], "partial_match")
+
+    def test_evidence_stays_when_its_own_text_is_unchanged(self):
+        """证据在其他项或前言里，那段原文没改时，不能被另一次模型结果翻掉。"""
+        template = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
+            {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}},
+            {"type": "textarea", "attributes": {"label": "环境"}, "validations": {"required": True}}]}
+        file = {**TEMPLATE_FILE, "content": yaml.safe_dump(template)}
+
+        def review(payload, key, model, base_url):
+            segments = payload["issue"]["segments"]
+            text = "\n".join(item["text"] for item in segments)
+            def ident(fragment):
+                return [item["id"] for item in segments if fragment in item["text"]]
+            described = "absent" if "翻掉" in text or "没有现象" in text else "answered"
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [], "fields": [
+                        {"field": "问题描述", "status": described, "evidence": ident("启动失败"), "ask": "请写现象"},
+                        {"field": "环境", "status": "answered", "evidence": ident("Ubuntu"), "ask": None}],
+                    "conflicts": []}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        original = "### 问题描述\n待补充\n### 环境\nUbuntu 上启动失败"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", original, [file],
+                                           "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(first["summary"]["status"], "pass")
+        noted = "翻掉\n### 问题描述\n待补充\n### 环境\nUbuntu 上启动失败"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            kept = analysis.analyze_issue("[Bug] 启动失败", noted, [file],
+                                          "key", "model", "https://model.example",
+                                          prior_snapshot=first["summary"]["assessment_snapshot"], **kwargs)
+        statuses = {item["field"]: item["status"] for item in kept["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "answered")
+        self.assertEqual(kept["summary"]["status"], "pass")
+        preface = "启动失败\n### 问题描述\n待补充\n### 环境\nUbuntu"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            preface_first = analysis.analyze_issue("[Bug] 启动失败", preface, [file],
+                                                   "key", "model", "https://model.example", **kwargs)
+        self.assertEqual(preface_first["summary"]["status"], "pass")
+        environment_changed = "启动失败\n### 问题描述\n待补充\n### 环境\nUbuntu 22\n翻掉"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            preface_kept = analysis.analyze_issue(
+                "[Bug] 启动失败", environment_changed, [file], "key", "model", "https://model.example",
+                prior_snapshot=preface_first["summary"]["assessment_snapshot"], **kwargs)
+        statuses = {item["field"]: item["status"] for item in preface_kept["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "answered")
+        preface_cleared = "没有现象\n### 问题描述\n待补充\n### 环境\nUbuntu 22"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            preface_lost = analysis.analyze_issue(
+                "[Bug] 启动失败", preface_cleared, [file], "key", "model", "https://model.example",
+                prior_snapshot=preface_kept["summary"]["assessment_snapshot"], **kwargs)
+        statuses = {item["field"]: item["status"] for item in preface_lost["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "absent")
+
+    def test_title_change_is_rechecked_without_flipping_local_evidence(self):
+        """只改标题会重新评估。证据仍在原段落里的结论保持不变。"""
+        calls = {"count": 0}
+
+        def review(payload, key, model, base_url):
+            calls["count"] += 1
+            evidence = [item["id"] for item in payload["issue"]["segments"] if "启动失败" in item["text"]]
+            status = "absent" if calls["count"] > 1 else "answered"
+            return {"template_fit": "correct", "template": "缺陷反馈", "reason": "当前模板适用",
+                    "maintainer": None, "alignments": [],
+                    "fields": [{"field": "问题描述", "status": status, "evidence": evidence, "ask": "请写现象"}],
+                    "conflicts": []}
+
+        kwargs = {"repository": "example/repo", "number": 18}
+        body = "### 问题描述\n启动失败"
+        with patch.object(compliance_assess, "consult", side_effect=review):
+            first = analysis.analyze_issue("[Bug] 启动失败", body, [TEMPLATE_FILE],
+                                           "key", "model", "https://model.example", **kwargs)
+            second = analysis.analyze_issue("[Bug] 无法启动", body, [TEMPLATE_FILE],
+                                            "key", "model", "https://model.example",
+                                            prior_snapshot=first["summary"]["assessment_snapshot"], **kwargs)
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(second["summary"]["status"], "pass")
+        statuses = {item["field"]: item["status"] for item in second["summary"]["assessment"]["fields"]}
+        self.assertEqual(statuses["问题描述"], "answered")
+
 
 if __name__ == "__main__":
     unittest.main()
