@@ -263,12 +263,29 @@ class QueueTests(unittest.TestCase):
                           attempts, next_attempt, updated_at)
                           VALUES ('moved', 'example/project', 22, 'queued', 1, ?, ?)""",
                        (now + worker.RETRY_DELAY, now))
-        receiver._mark_dispatching(self.config, "moved", now + 30)
+        receiver._mark_dispatching(self.config, "moved", now + 30, now)
         row = [item for item in self.rows() if item["event_id"] == "moved"][0]
         self.assertEqual(row["state"], "queued")
-        receiver._mark_dispatching(self.config, "moved", now + worker.RETRY_DELAY)
+        receiver._mark_dispatching(self.config, "moved", now + worker.RETRY_DELAY, now)
         row = [item for item in self.rows() if item["event_id"] == "moved"][0]
         self.assertEqual(row["state"], "dispatching")
+
+    def test_cooldown_ack_is_not_marked_dispatched_afterwards(self):
+        """限流期间先确认消息时，晚到的投递确认不能再把任务写成 dispatching。"""
+        now = time.time()
+        lease = now + 30
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('leased', 'example/project', 23, 'queued', 0, ?, ?)""",
+                       (lease, now))
+            db.execute("INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)", (now + 1,))
+        action = worker.handle_delivery(self.config, {"event_id": "leased"}, False, client=object())
+        self.assertEqual(action, "ack")
+        receiver._mark_dispatching(self.config, "leased", lease, now)
+        row = [item for item in self.rows() if item["event_id"] == "leased"][0]
+        self.assertEqual(row["state"], "queued")
+        self.assertNotEqual(row["updated_at"], now)
 
     def test_duplicate_dispatching_event_is_not_published_again(self):
         with patch.object(receiver, "publish_analysis_task") as publish:

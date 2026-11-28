@@ -321,6 +321,17 @@ class DecideReviewTests(unittest.TestCase):
         self.assertTrue(assess.model_configured("", "model", "https://models.example", ("key-a",)))
         self.assertFalse(assess.model_configured("key", "", "https://models.example", ("key-a",)))
 
+    def test_link_in_reason_is_removed_and_the_review_stands(self):
+        decision = assess.decide_review(program("pass", []), [TEMPLATE], {
+            "template_fit": "correct", "template": "缺陷反馈",
+            "reason": "复现见 https://example.com/log 中的报错",
+            "fields": [{"field": "预期结果", "status": "answered", "evidence": ["S2"], "ask": None}],
+            "conflicts": [],
+        }, SEGMENTS)
+        self.assertIsNone(decision.get("fallback"))
+        self.assertEqual(decision["status"], "pass")
+        self.assertNotIn("http", decision["assessment"]["reason"] if "reason" in decision["assessment"] else "")
+
     def test_unknown_template_name_on_a_wrong_fit_retries(self):
         decision = assess.decide_review(program(), [TEMPLATE], {
             "template_fit": "wrong", "template": "不存在的模板", "reason": "应该换模板",

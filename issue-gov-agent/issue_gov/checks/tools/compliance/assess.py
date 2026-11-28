@@ -15,7 +15,7 @@ from issue_gov.checks.tools.compliance.segment import segment_body
 _FITS = {"correct", "wrong", "not_applicable", "insufficient_info"}
 _FIELD_STATUS = {"answered", "partial", "absent"}
 _CONFLICTS = {"version_env", "step_result", "expectation_inverted"}
-_LINK = re.compile(r"https?://|@", re.IGNORECASE)
+_LINK = re.compile(r"https?://\S+|@[A-Za-z0-9][A-Za-z0-9_-]*", re.IGNORECASE)
 
 
 def model_configured(agent_api_key: str, model: str, base_url: str,
@@ -99,10 +99,11 @@ def structure_problems(check: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _plain(value: Any, limit: int) -> str | None:
+    """去掉链接和 @ 提及。其余文字仍可用，避免整份评估因为一句带链接的说明被丢掉。"""
     if not isinstance(value, str):
         return None
-    text = " ".join(value.split())
-    if not text or len(text) > limit or _LINK.search(text):
+    text = " ".join(_LINK.sub(" ", value).split())
+    if not text or len(text) > limit:
         return None
     return text
 

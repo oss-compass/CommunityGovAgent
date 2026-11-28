@@ -645,9 +645,9 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
             cooldown = db.execute("SELECT until FROM api_cooldown WHERE name = 'atomgit'").fetchone()
             if cooldown is not None and cooldown["until"] > now and state in ("queued", "dispatching"):
                 # 只推迟尚未开始处理的任务；running 行由正在执行的消费者持有，改回 queued 会让它的完成写入落空。
-                db.execute("""UPDATE events SET state='queued', next_attempt=?
+                db.execute("""UPDATE events SET state='queued', next_attempt=?, updated_at=?
                               WHERE event_id=? AND state IN ('queued', 'dispatching')""",
-                           (max(cooldown["until"], row["next_attempt"]), event_id))
+                           (max(cooldown["until"], row["next_attempt"]), now, event_id))
                 return "ack"
             # 队列里的消息就是这一次投递，直接领取。next_attempt 只让重试线程晚一点再发新消息。
             if state == "running" and not redelivered:
@@ -718,8 +718,9 @@ def republish_due(config: Config) -> int:
     from common.queueing import QueuePublishError, publish_analysis_task
     from issue_gov.checks.base import default_checks, parse_checks
 
+    claimed_at = time.time()
     try:
-        rows = claim_due(config.database_url, time.time())
+        rows = claim_due(config.database_url, claimed_at)
     except Exception:
         LOG.exception("读取到期任务失败")
         return 0
@@ -736,10 +737,10 @@ def republish_due(config: Config) -> int:
             )
             published += 1
             with connect(config) as db:
-                # 只盖住仍停在这次租约上的行。消费者已经改去重试时，不能再写成 dispatching。
+                # 只盖住仍停在这次租约上的行。消费者已经确认并改过更新时间时，不能再写成 dispatching。
                 db.execute("""UPDATE events SET state='dispatching'
-                              WHERE event_id=? AND state='queued' AND next_attempt=?""",
-                           (row["event_id"], row["next_attempt"]))
+                              WHERE event_id=? AND state='queued' AND next_attempt=? AND updated_at=?""",
+                           (row["event_id"], row["next_attempt"], claimed_at))
         except QueuePublishError:
             with connect(config) as db:
                 for waiting in rows[index:]:

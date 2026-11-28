@@ -200,10 +200,11 @@ def create_app(config: Config | None = None) -> Flask:
                 db.execute("BEGIN IMMEDIATE")
                 # PostgreSQL 下 BEGIN 是空操作，用按 Issue 的咨询锁让同一 Issue 的入队串行执行
                 lock_issue(db, repository, number)
-                row = db.execute("SELECT state, checks, next_attempt FROM events WHERE event_id = ?",
+                row = db.execute("SELECT state, checks, next_attempt, updated_at FROM events WHERE event_id = ?",
                                  (event_id,)).fetchone()
                 added = row is None
                 stored_state = "" if row is None else row["state"]
+                updated_stamp = None
                 checks = default_checks() if row is None or not row["checks"] else json.loads(row["checks"])
                 if added:
                     previous = db.execute("""SELECT attempts, next_attempt FROM events
@@ -220,6 +221,7 @@ def create_app(config: Config | None = None) -> Flask:
                     next_attempt = now + PUBLISH_GRACE if config.rabbitmq_url else (
                         previous["next_attempt"] if previous else 0)
                     publish_stamp = next_attempt
+                    updated_stamp = now
                     db.execute("""INSERT INTO events(event_id, repository, issue_number, updated_at,
                                                     attempts, next_attempt, state, checks)
                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -229,6 +231,7 @@ def create_app(config: Config | None = None) -> Flask:
                                 dump_checks(default_checks())))
                 elif stored_state == "queued":
                     publish_stamp = row["next_attempt"]
+                    updated_stamp = row["updated_at"]
         except (sqlite3.Error, DatabaseError):
             LOG.error("通知保存失败：仓库=%s，Issue=#%s，数据库写入失败，请检查磁盘空间和目录权限",
                       repository, number)
@@ -245,7 +248,7 @@ def create_app(config: Config | None = None) -> Flask:
                 LOG.error("通知已保存但未能投递到消息队列：仓库=%s，Issue=#%s，事件=%s",
                           repository, number, event_id[:12])
                 return jsonify(error="queue unavailable"), 503
-            _mark_dispatching(config, event_id, publish_stamp)
+            _mark_dispatching(config, event_id, publish_stamp, updated_stamp)
 
         LOG.info("%s：仓库=%s，Issue=#%s，事件=%s",
                  "收到通知，已加入队列" if added else "收到重复通知，已去重，不再新增任务",
@@ -292,13 +295,13 @@ def _release_dispatch(config: Config, event_id: str) -> None:
         LOG.error("任务未能退回等待投递：事件=%s", event_id[:12])
 
 
-def _mark_dispatching(config: Config, event_id: str, next_attempt: float) -> None:
-    """代理确认后标记为已投递。消费者若已改过下次投递时间，说明任务已进入重试，不能再盖回。"""
+def _mark_dispatching(config: Config, event_id: str, next_attempt: float, updated_at: float) -> None:
+    """代理确认后标记为已投递。消费者若已改过租约或更新时间，说明消息已被确认，不能再盖回。"""
     try:
         with connect(config) as db:
             db.execute("""UPDATE events SET state='dispatching'
-                          WHERE event_id=? AND state='queued' AND next_attempt=?""",
-                       (event_id, next_attempt))
+                          WHERE event_id=? AND state='queued' AND next_attempt=? AND updated_at=?""",
+                       (event_id, next_attempt, updated_at))
     except (sqlite3.Error, DatabaseError):
         LOG.error("任务已投递但状态更新失败：事件=%s", event_id[:12])
 
