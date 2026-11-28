@@ -15,7 +15,11 @@ from issue_gov.checks.tools.compliance.segment import segment_body
 _FITS = {"correct", "wrong", "not_applicable", "insufficient_info"}
 _FIELD_STATUS = {"answered", "partial", "absent"}
 _CONFLICTS = {"version_env", "step_result", "expectation_inverted"}
-_LINK = re.compile(r"https?://\S+|@[A-Za-z0-9][A-Za-z0-9_-]*", re.IGNORECASE)
+# 只去掉网址本身。中文说明常常紧挨在链接后面，不能把后面的字一起删掉。
+_LINK = re.compile(
+    r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'*+,;=%]+|@[A-Za-z0-9][A-Za-z0-9_-]*",
+    re.IGNORECASE,
+)
 
 
 def model_configured(agent_api_key: str, model: str, base_url: str,

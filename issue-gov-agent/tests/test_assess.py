@@ -330,7 +330,16 @@ class DecideReviewTests(unittest.TestCase):
         }, SEGMENTS)
         self.assertIsNone(decision.get("fallback"))
         self.assertEqual(decision["status"], "pass")
-        self.assertNotIn("http", decision["assessment"]["reason"] if "reason" in decision["assessment"] else "")
+        self.assertEqual(assess._plain("复现见https://example.com/log中的报错，请看 @owner", 500),
+                         "复现见 中的报错，请看")
+        self.assertIsNone(assess._plain("https://example.com/only-a-link", 500))
+        only_link = assess.decide_review(program("pass", []), [TEMPLATE], {
+            "template_fit": "correct", "template": "缺陷反馈",
+            "reason": "https://example.com/only-a-link",
+            "fields": [{"field": "预期结果", "status": "answered", "evidence": ["S2"], "ask": None}],
+            "conflicts": [],
+        }, SEGMENTS)
+        self.assertEqual(only_link.get("fallback"), "program")
 
     def test_unknown_template_name_on_a_wrong_fit_retries(self):
         decision = assess.decide_review(program(), [TEMPLATE], {

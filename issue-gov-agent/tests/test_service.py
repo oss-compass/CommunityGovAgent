@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -286,6 +287,86 @@ class QueueTests(unittest.TestCase):
         row = [item for item in self.rows() if item["event_id"] == "leased"][0]
         self.assertEqual(row["state"], "queued")
         self.assertNotEqual(row["updated_at"], now)
+
+    def test_related_delivery_races_do_not_lose_or_cover_the_task(self):
+        """限流、完成、覆盖和重试之后，晚到的投递确认都停在原来的结论上。"""
+        now = time.time()
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('done', 'example/project', 31, 'completed', 1, ?, ?)""",
+                       (now + 5, now))
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('old', 'example/project', 32, 'superseded', 0, ?, ?)""",
+                       (now + 5, now))
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state,
+                          attempts, next_attempt, updated_at)
+                          VALUES ('held', 'example/project', 33, 'dispatching', 0, ?, ?)""",
+                       (now + 30, now))
+            db.execute("INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)", (now + 60,))
+        receiver._mark_dispatching(self.config, "done", now + 5, now)
+        receiver._mark_dispatching(self.config, "old", now + 5, now)
+        action = worker.handle_delivery(self.config, {"event_id": "held"}, False, client=object())
+        self.assertEqual(action, "ack")
+        receiver._mark_dispatching(self.config, "held", now + 30, now)
+        rows = {row["event_id"]: row for row in self.rows()}
+        self.assertEqual(rows["done"]["state"], "completed")
+        self.assertEqual(rows["old"]["state"], "superseded")
+        self.assertEqual(rows["held"]["state"], "queued")
+        self.assertEqual(rows["held"]["attempts"], 0)
+        self.assertGreaterEqual(rows["held"]["next_attempt"], now + 59)
+
+    def test_in_flight_message_is_not_marked_dispatched_after_it_was_handled(self):
+        """消息在投递确认之前就被处理时，确认不能把已完成或已推迟的任务盖回去。"""
+        event_id = hashlib.sha256(b"example/project:event-1").hexdigest()
+
+        def finish_before_confirm(*_args, **_kwargs):
+            with patch.object(worker, "_process_issue", return_value=dict(RESULT)):
+                self.assertEqual(
+                    worker.handle_delivery(self.config, {"event_id": event_id}, False, client=object()),
+                    "ack")
+
+        with patch.object(receiver, "publish_analysis_task", side_effect=finish_before_confirm):
+            response = self.post()
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(self.rows()[0]["state"], "completed")
+
+        payload = {**self.payload, "uuid": "event-cooldown", "object_attributes": {"action": "open", "iid": 41}}
+        cooldown_id = hashlib.sha256(b"example/project:event-cooldown").hexdigest()
+        with receiver.connect(self.config) as db:
+            db.execute("INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)", (time.time() + 60,))
+
+        def defer_before_confirm(*_args, **_kwargs):
+            self.assertEqual(
+                worker.handle_delivery(self.config, {"event_id": cooldown_id}, False, client=object()),
+                "ack")
+
+        with patch.object(receiver, "publish_analysis_task", side_effect=defer_before_confirm):
+            deferred = self.post(payload)
+        self.assertEqual(deferred.status_code, 202)
+        held = [row for row in self.rows() if row["event_id"] == cooldown_id][0]
+        self.assertEqual(held["state"], "queued")
+        self.assertEqual(held["attempts"], 0)
+        with receiver.connect(self.config) as db:
+            db.execute("DELETE FROM api_cooldown")
+
+        payload = {**self.payload, "uuid": "event-retry", "object_attributes": {"action": "open", "iid": 42}}
+        retry_id = hashlib.sha256(b"example/project:event-retry").hexdigest()
+
+        def fail_before_confirm(*_args, **_kwargs):
+            with patch.object(worker, "_process_issue", side_effect=IssueProcessingError("暂时失败")):
+                self.assertEqual(
+                    worker.handle_delivery(self.config, {"event_id": retry_id}, False, client=object()),
+                    "ack")
+
+        with patch.object(receiver, "publish_analysis_task", side_effect=fail_before_confirm):
+            retried = self.post(payload)
+        self.assertEqual(retried.status_code, 202)
+        retry = [row for row in self.rows() if row["event_id"] == retry_id][0]
+        self.assertEqual(retry["state"], "queued")
+        self.assertEqual(retry["attempts"], 1)
+        self.assertGreater(retry["next_attempt"], time.time())
 
     def test_duplicate_dispatching_event_is_not_published_again(self):
         with patch.object(receiver, "publish_analysis_task") as publish:
